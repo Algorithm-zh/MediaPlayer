@@ -19,6 +19,7 @@ public:
   // 打开媒体文件并初始化
   MediaPlayer(const char *url);
   ~MediaPlayer();
+  void start();
   // 读取数据,从视频流读取数据包packet并解码到frame中,并且转换成对应的格式存储起来
   void readData();
   int decode_packet(AVCodecContext* codecCtx, AVPacket* packet);
@@ -27,6 +28,11 @@ public:
   //音频sdl回调函数
   void audioDataRead(void *userdata, Uint8 *stream, int len);
   static void audioCallback(void *userdata, Uint8 *stream, int len);
+
+  //解码线程
+  void video_thread();
+  void audio_thread();
+  
 
 
 private:
@@ -72,6 +78,8 @@ private:
   SDL_Rect *rect{NULL};
   // 事件
   SDL_Event event;
+  //结束符号
+  bool is_close{false};
 
   PacketQueue vPacket_queue;
   PacketQueue aPacket_queue;
@@ -85,6 +93,16 @@ private:
 
   //线程
   std::vector<std::thread> th;
-  std::mutex mtx;
-  std::condition_variable cond;
+  //读取得到原始Packet锁和条件变量
+  std::mutex video_Packet_mtx;
+  std::mutex audio_Packet_mtx;
+  std::condition_variable video_Packet_cond;
+  std::condition_variable audio_Packet_cond;
+  //解码得到的帧锁和条件变量
+  std::mutex video_Frame_mtx;
+  std::mutex audio_Frame_mtx;
+  std::condition_variable video_Frame_cond;
+  std::condition_variable audio_Frame_cond;
 };
+ 
+

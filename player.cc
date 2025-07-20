@@ -1,13 +1,13 @@
 #include "player.h"
-#include <SDL2/SDL_audio.h>
-#include <mutex>
+#include <SDL2/SDL_events.h>
+#include <chrono>
 namespace
 {
-  const int MAX_AUDIO_FRAME_SIZE = 1024;
   const int MAX_QUEUE_SIZE = 1024;
 }
 MediaPlayer::MediaPlayer(const char* url)
 {
+  th.resize(4);
   /*
   * AVFormatContext 包含了媒体信息有关的成员
   * struct AVInputFormat *iformat //封装格式的信息
@@ -123,16 +123,38 @@ MediaPlayer::MediaPlayer(const char* url)
     return;
   }
   allocFrame();
-
+  //初始化sdl
+  if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER))
+  {
+    std::cerr << "初始化sdl失败:" << SDL_GetError();
+    return;
+  }
   //初始化sdl音频设置
   wanted_spec.freq = aCodecCtx->sample_rate;//采样率
   wanted_spec.format = AUDIO_S16SYS;//音频数据格式, singned 16bits 大小端和系统保持一致
-  wanted_spec.channels = 2;//声道数
+  wanted_spec.channels = aCodecCtx->ch_layout.nb_channels;//声道数
   wanted_spec.samples = 1024;//采样大小(用多少位来记录振幅)
   wanted_spec.silence = 0;//是否静音
   audio_callback = audioCallback;
-  wanted_spec.callback = audio_callback;//sdl会持续调研这个回调函数来填充固定数量的字节到音频缓冲区
-  wanted_spec.userdata = this;
+  wanted_spec.callback = audio_callback;//sdl会持续调用这个回调函数来填充固定数量的字节到音频缓冲区
+  wanted_spec.userdata = this;//将this传入方便回调audioDateRead
+
+  //初始化滤镜上下文
+  sws_ctx = sws_getContext(pCodecCtx->width, pCodecCtx->height,
+                           pCodecCtx->pix_fmt, pCodecCtx->width, pCodecCtx->height,
+                           AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
+
+  //打开音频
+  if(SDL_OpenAudio(&wanted_spec, &spec) < 0)
+  {
+    std::cerr << "sdl打开音频失败:" << SDL_GetError() << std::endl;
+    return;
+  }
+
+  //开始播放音频
+  SDL_PauseAudio(0);
+
+  std::cout << "初始化完毕" << std::endl;
 }
  
 void MediaPlayer::allocFrame()  {
@@ -168,53 +190,37 @@ void MediaPlayer::allocFrame()  {
 }
  
 void MediaPlayer::readData()  {
-  int i = 0;
-  //初始化滤镜上下文
-  sws_ctx = sws_getContext(pCodecCtx->width, pCodecCtx->height,
-                           pCodecCtx->pix_fmt, pCodecCtx->width, pCodecCtx->height,
-                           AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
-  //初始化sdl
-  sdl_init();
-  //打开音频
-  if(SDL_OpenAudio(&wanted_spec, &spec) < 0)
-  {
-    std::cerr << "sdl打开音频失败:" << SDL_GetError() << std::endl;
-    return;
-  }
-  //开始从视频流中读取数据包
-  while(av_read_frame(pFormatCtx, packet) >= 0)
+ //开始从视频流中读取数据包
+  while(!is_close && av_read_frame(pFormatCtx, packet) >= 0)
   {
     packet_queue_put();
     //释放掉packet指向的内存,以方便读下一个包
     av_packet_unref(packet);
-    if(packet->stream_index == videoStreamIndex)
-    {
-      while(!vPacket_queue.empty())
-      {
-        AVPacket *pkt = vPacket_queue.front();
-        vPacket_queue.pop();
-        decode_packet(pCodecCtx, pkt);
-      }
+    SDL_PollEvent(&event);
+    switch (event.type) {
+      case SDL_QUIT:
+        std::cout << "SDL_QUIT" << std::endl;
+        is_close = true;
+        break;
     }
-    else if(packet->stream_index == audioStreamIndex)
-    {
-      while(!aPacket_queue.empty())
-      {
-        AVPacket *pkt = aPacket_queue.front();
-        aPacket_queue.pop();
-        decode_packet(aCodecCtx, pkt);
-      }
-    }
-    showFrame();
   }
+  std::cout << "读取数据结束" << std::endl;
 }
 
 
 MediaPlayer::~MediaPlayer()  {
-  av_frame_free(&pFrameRGB); 
+
+  SDL_CloseAudio(); // 先关闭音频播放（阻止后续回调）
+  SDL_DestroyTexture(texture);
+  SDL_DestroyRenderer(render);
+  SDL_DestroyWindow(window);
+  SDL_Quit(); // SDL 清理
+
+  av_frame_free(&pFrameYUV); 
   av_frame_free(&pFrame);
   av_packet_free(&packet);
   avcodec_free_context(&pCodecCtx);
+  avcodec_free_context(&aCodecCtx);
   avformat_close_input(&pFormatCtx);
 }
 
@@ -222,11 +228,20 @@ MediaPlayer::~MediaPlayer()  {
 //使用sdl将yuv显示到屏幕上
 void MediaPlayer::showFrame()  {
   
-  std::lock_guard<std::mutex> lock(mtx);
-  while(!vFrame_queue.empty())
+  //初始化sdl, 这个函数需要和showFrame在一个线程里
+  sdl_init();
+  std::unique_lock<std::mutex> lock(video_Frame_mtx);
+  while(true)
   {
+    video_Frame_cond.wait_for(lock, std::chrono::milliseconds(1000), [&](){
+      return !vFrame_queue.empty();
+    });
+    if(is_close && vFrame_queue.empty())break;
+    else if(vFrame_queue.empty())continue;
     AVFrame *frame = vFrame_queue.front();
     vFrame_queue.pop();
+
+    //将像素格式转换为我们想要的
     auto ret = sws_scale(sws_ctx, frame->data, frame->linesize, 0,
                         frame->height,pFrameYUV->data, pFrameYUV->linesize);
     if(ret < 0)
@@ -251,26 +266,41 @@ void MediaPlayer::showFrame()  {
     }
     //3.显示画面
     SDL_RenderPresent(render);
+    //重要操作。延迟播放
     SDL_Delay(40);    
+    //记得回收内存
+    av_frame_free(&frame);
   }
+  std::cout << "视频播放结束" << std::endl;
 }
  
 //初始化sdl
 void MediaPlayer::sdl_init()  {
-  //1.初始化
-  if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER))
-  {
-    std::cerr << "初始化sdl失败:" << SDL_GetError();
-    return;
-  }
+
   //2.创建窗口
   //创建一个标题为Video,窗口坐标在中间的宽高和视频一样的窗口
   window = SDL_CreateWindow("Video", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, pCodecCtx->width, pCodecCtx->height, SDL_WINDOW_SHOWN);
+  if(!window)
+  {
+    std::cerr << "创建sdl窗口失败" << std::endl;
+    return;
+  }
   //3.创建渲染器
   //初始化默认的渲染设备，使用软件渲染,和显示器的刷新率同步
   render = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+  if(!render)
+  {
+    std::cerr << "创建sdl渲染器失败" << std::endl;
+    return;
+  }
   //4.创建纹理
   texture = SDL_CreateTexture(render, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING, pCodecCtx->width, pCodecCtx->height);
+  if(!texture)
+  {
+    std::cerr << "创建sdl纹理失败" << std::endl;
+    return;
+  }
+
 }
 
 void MediaPlayer::audioCallback(void *userdata, Uint8 *stream, int len) {
@@ -278,56 +308,66 @@ void MediaPlayer::audioCallback(void *userdata, Uint8 *stream, int len) {
   m->audioDataRead(m->aCodecCtx, stream, len);
 }
 
+//音频回调函数
 void MediaPlayer::audioDataRead(void *userdata, Uint8 *stream, int len) {
+
+  //这个函数不需要写成循环，因为sdl会自己一直调用的
   AVCodecContext *aCodecCtx = (AVCodecContext *)userdata;
-  std::lock_guard<std::mutex> lock(mtx);
-  while(!aFrame_queue.empty())
+  std::unique_lock<std::mutex> lock(audio_Frame_mtx);
+  if(aFrame_queue.empty())return;
+  AVFrame *frame = aFrame_queue.front();
+  aFrame_queue.pop();
+  //获取音频帧的大小
+  int data_size = av_samples_get_buffer_size(frame->linesize, frame->ch_layout.nb_channels, frame->nb_samples, aCodecCtx->sample_fmt, 1);
+  //len为sdl需要我们写入的缓冲区的大小
+  if(data_size > len)
   {
-    AVFrame *frame = aFrame_queue.front();
-    aFrame_queue.pop();
-    int data_size = av_samples_get_buffer_size(NULL, 2, frame->nb_samples, aCodecCtx->sample_fmt, 1);
-    if(data_size > len)
-    {
-      len = data_size;
-    }
-    memcpy(stream, (uint8_t*)frame->data[0], data_size);
-    stream += data_size;
-    len -= data_size;
-    av_frame_free(&frame);
+    data_size = len;
   }
+  //将音频数据拷贝到sdl要读取的缓冲区里
+  memcpy(stream, (uint8_t*)frame->data[0], data_size);
+  stream += data_size;
+  len -= data_size;
+  av_frame_free(&frame);
+  
+  std::cout << "音频播放结束" << std::endl;
 }
 
  
 int MediaPlayer::packet_queue_put()  {
+
   AVPacket *pkt = av_packet_alloc();
   if(av_packet_ref(pkt, packet) < 0)
   {
     std::cerr << "packet copy失败" << std::endl;
     return -1;
   }
-  std::lock_guard<std::mutex> lock(mtx);
   if(pkt->stream_index == audioStreamIndex)
   {
+    std::lock_guard<std::mutex> lock(audio_Packet_mtx);
     //缓冲队列满了，选择丢包处理
-    while(aPacket_queue.size() > MAX_QUEUE_SIZE)
+    if(aPacket_queue.size() >= MAX_QUEUE_SIZE)
     {
       AVPacket *old = aPacket_queue.front();
       aPacket_queue.pop();
       av_packet_free(&old);
     }
     aPacket_queue.push(pkt);
+    //缓冲队列新加了数据，唤醒条件变量
+    audio_Packet_cond.notify_all();
   }
-  else if(packet->stream_index == videoStreamIndex)
+  else if(pkt->stream_index == videoStreamIndex)
   {
-    while(vPacket_queue.size() > MAX_QUEUE_SIZE)
+    std::lock_guard<std::mutex> lock(video_Packet_mtx);
+    if(vPacket_queue.size() >= MAX_QUEUE_SIZE)
     {
       AVPacket *old = vPacket_queue.front();
       vPacket_queue.pop();
       av_packet_free(&old);
     }
     vPacket_queue.push(pkt); 
+    video_Packet_cond.notify_all();
   }
-  cond.notify_all();
   return 0;
 }
  
@@ -357,10 +397,10 @@ int MediaPlayer::decode_packet(AVCodecContext* codecCtx, AVPacket* packet)  {
       av_frame_free(&frame);
       return -1;
     }
-    std::lock_guard<std::mutex> lock(mtx);
     if(codecCtx->codec->type == AVMEDIA_TYPE_VIDEO)
     {
-      while(vFrame_queue.size() > MAX_QUEUE_SIZE)
+      std::lock_guard<std::mutex> lock(video_Frame_mtx);
+      if(vFrame_queue.size() > MAX_QUEUE_SIZE)
       {
         //缓冲队列过大，丢帧处理
         AVFrame *old = vFrame_queue.front();
@@ -368,18 +408,75 @@ int MediaPlayer::decode_packet(AVCodecContext* codecCtx, AVPacket* packet)  {
         av_frame_free(&old);
       }
       vFrame_queue.push(frame);
+      video_Frame_cond.notify_all();
     }
     else if(codecCtx->codec->type == AVMEDIA_TYPE_AUDIO)
     {
-      while(aFrame_queue.size() > MAX_QUEUE_SIZE)
+      std::lock_guard<std::mutex> lock(audio_Frame_mtx);
+      if(aFrame_queue.size() > MAX_QUEUE_SIZE)
       {
         AVFrame *old = aFrame_queue.front();
         aFrame_queue.pop();
         av_frame_free(&old);
       }
       aFrame_queue.push(frame);
+      audio_Frame_cond.notify_all();
     }
-    cond.notify_all();
   }
   return 0;
+}
+ 
+void MediaPlayer::video_thread()  {
+
+  std::unique_lock<std::mutex> lock(video_Packet_mtx);
+  while(true)
+  {
+    //条件变量阻塞直到有新数据进来
+    video_Packet_cond.wait_for(lock, std::chrono::milliseconds(1000), [&](){
+      return !vPacket_queue.empty();
+    });
+    //等待1000ms还没有数据认为程序已经结束
+    if(is_close && vPacket_queue.empty())break;
+    else if(vPacket_queue.empty())continue;//如果状态没有设置为已经关闭则继续
+    AVPacket *pkt = vPacket_queue.front();
+    vPacket_queue.pop();
+    //解码并放到帧队列
+    decode_packet(pCodecCtx, pkt);
+    av_packet_free(&pkt);
+  }
+  std::cout << "视频解码结束" << std::endl;
+}
+
+ 
+void MediaPlayer::audio_thread()  {
+
+  std::unique_lock<std::mutex> lock(audio_Packet_mtx);
+  while(true)
+  {
+    //条件变量阻塞直到有新数据进来(最多等待1000ms)
+    audio_Packet_cond.wait_for(lock, std::chrono::milliseconds(1000), [&](){
+        return !aPacket_queue.empty();
+    });
+    //等待1000ms还没有数据且设置关闭状态则认为程序已经结束
+    if(is_close && aPacket_queue.empty())break;
+    else if(aPacket_queue.empty())continue;
+    AVPacket *pkt = aPacket_queue.front();
+    aPacket_queue.pop();
+    decode_packet(aCodecCtx, pkt);
+    av_packet_free(&pkt);
+  }
+  std::cout << "音频解码结束" << std::endl;
+}
+ 
+void MediaPlayer::start()  {
+  th[0] = std::thread(&MediaPlayer::readData, this); 
+  th[1] = std::thread(&MediaPlayer::video_thread, this); 
+  th[2] = std::thread(&MediaPlayer::audio_thread, this); 
+  th[3] = std::thread(&MediaPlayer::showFrame, this);
+
+  th[0].join();
+  th[1].join();
+  th[2].join();
+  th[3].join();
+  std::cout << "执行完毕" << std::endl;
 }
