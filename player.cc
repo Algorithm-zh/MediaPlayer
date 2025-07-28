@@ -1,6 +1,10 @@
 #include "player.h"
 #include <SDL2/SDL_events.h>
 #include <chrono>
+#include <libavformat/avformat.h>
+#include <libavutil/channel_layout.h>
+#include <libavutil/samplefmt.h>
+#include <libswresample/swresample.h>
 namespace
 {
   const int MAX_QUEUE_SIZE = 1024;
@@ -132,6 +136,7 @@ MediaPlayer::MediaPlayer(const char* url)
   //初始化sdl音频设置
   wanted_spec.freq = aCodecCtx->sample_rate;//采样率
   wanted_spec.format = AUDIO_S16SYS;//音频数据格式, singned 16bits 大小端和系统保持一致
+  //wanted_spec.format = AUDIO_F32SYS;
   wanted_spec.channels = aCodecCtx->ch_layout.nb_channels;//声道数
   wanted_spec.samples = 1024;//采样大小(用多少位来记录振幅)
   wanted_spec.silence = 0;//是否静音
@@ -143,6 +148,17 @@ MediaPlayer::MediaPlayer(const char* url)
   sws_ctx = sws_getContext(pCodecCtx->width, pCodecCtx->height,
                            pCodecCtx->pix_fmt, pCodecCtx->width, pCodecCtx->height,
                            AV_PIX_FMT_YUV420P, SWS_BILINEAR, NULL, NULL, NULL);
+  //初始化SwrContext
+  int ret = swr_alloc_set_opts2(&swr_ctx, &aCodecCtx->ch_layout, 
+                                AV_SAMPLE_FMT_S16, aCodecCtx->sample_rate,
+                                &aCodecCtx->ch_layout, aCodecCtx->sample_fmt,
+                                aCodecCtx->sample_rate, 0, NULL);
+  if(ret < 0)
+  {
+    std::cerr << "初始化SwrContext失败" << std::endl;
+    return;
+  }
+  swr_init(swr_ctx);
 
   //打开音频
   if(SDL_OpenAudio(&wanted_spec, &spec) < 0)
@@ -204,6 +220,7 @@ void MediaPlayer::readData()  {
         break;
     }
   }
+  is_close = true;
   std::cout << "读取数据结束" << std::endl;
 }
 
@@ -267,7 +284,7 @@ void MediaPlayer::showFrame()  {
     //3.显示画面
     SDL_RenderPresent(render);
     //重要操作。延迟播放
-    SDL_Delay(40);    
+    SDL_Delay(75);    
     //记得回收内存
     av_frame_free(&frame);
   }
@@ -317,6 +334,15 @@ void MediaPlayer::audioDataRead(void *userdata, Uint8 *stream, int len) {
   if(aFrame_queue.empty())return;
   AVFrame *frame = aFrame_queue.front();
   aFrame_queue.pop();
+
+  //分配临时缓冲区
+  if(!audio_buf)
+  {
+    std::cout << "未分配缓冲区" << std::endl;
+    audio_buf = (uint8_t*)av_malloc(192000);
+  }
+  //音频格式转换
+  int out_samples = swr_convert(swr_ctx, (uint8_t * const *)&audio_buf, frame->nb_samples, frame->extended_data, frame->nb_samples);
   //获取音频帧的大小
   int data_size = av_samples_get_buffer_size(frame->linesize, frame->ch_layout.nb_channels, frame->nb_samples, aCodecCtx->sample_fmt, 1);
   //len为sdl需要我们写入的缓冲区的大小
@@ -325,12 +351,11 @@ void MediaPlayer::audioDataRead(void *userdata, Uint8 *stream, int len) {
     data_size = len;
   }
   //将音频数据拷贝到sdl要读取的缓冲区里
-  memcpy(stream, (uint8_t*)frame->data[0], data_size);
+  //memcpy(stream, frame->data[0], data_size);
+  memcpy(stream, audio_buf, data_size);
   stream += data_size;
   len -= data_size;
   av_frame_free(&frame);
-  
-  std::cout << "音频播放结束" << std::endl;
 }
 
  

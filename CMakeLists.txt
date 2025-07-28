@@ -15,6 +15,13 @@ add_executable(player ${SRC})
 target_link_directories(player PUBLIC ${FFMPEG_LIBRARY_DIR})
 include_directories(${FFMPEG_INCLUDE_DIR})
 
-target_link_libraries(player avcodec avformat swscale avutil SDL2 pthread)
+target_link_libraries(player
+                      avcodec
+                      avformat
+                      swscale
+                      avutil
+                      swresample
+                      SDL2
+                      pthread)
 
 

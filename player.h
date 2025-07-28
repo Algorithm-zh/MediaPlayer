@@ -5,6 +5,8 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
+#include <libavutil/channel_layout.h>
 }
 #include <iostream>
 #include <queue>
@@ -90,6 +92,11 @@ private:
   SDL_AudioSpec wanted_spec;
   SDL_AudioSpec spec;
   SDL_AudioCallback audio_callback{NULL};
+  //音频格式转换部分
+  SwrContext *swr_ctx{NULL};
+  //音频格式转换时的缓冲区
+  uint8_t *audio_buf = nullptr;
+  
 
   //线程
   std::vector<std::thread> th;
