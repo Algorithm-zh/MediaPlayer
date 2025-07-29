@@ -13,6 +13,7 @@ extern "C" {
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+#include <sys/time.h>
 
 class MediaPlayer {
   using PacketQueue = std::queue<AVPacket*>;
@@ -110,6 +111,11 @@ private:
   std::mutex audio_Frame_mtx;
   std::condition_variable video_Frame_cond;
   std::condition_variable audio_Frame_cond;
+
+
+  //视频同步
+  struct timeval start_time;
+  struct timeval cur_time;
 };
  
 

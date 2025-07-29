@@ -3,8 +3,10 @@
 #include <chrono>
 #include <libavformat/avformat.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/rational.h>
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
+#include <sys/select.h>
 namespace
 {
   const int MAX_QUEUE_SIZE = 1024;
@@ -206,7 +208,9 @@ void MediaPlayer::allocFrame()  {
 }
  
 void MediaPlayer::readData()  {
- //开始从视频流中读取数据包
+  //获取开始读取包的时间
+  gettimeofday(&start_time, NULL);
+  //开始从视频流中读取数据包
   while(!is_close && av_read_frame(pFormatCtx, packet) >= 0)
   {
     packet_queue_put();
@@ -281,10 +285,21 @@ void MediaPlayer::showFrame()  {
       std::cerr << "复制纹理失败" << std::endl;
       return;
     }
+    
+    //获取当前时间
+    gettimeofday(&cur_time, NULL);
+    //得到从开始读取数据到现在时间过去了多久
+    double time = cur_time.tv_sec - start_time.tv_sec + (double)(cur_time.tv_usec - start_time.tv_usec) / 1000000.0;
+    //得到该帧还有多久才是他播放的时间(注意：时间基只能从AVFormatContext里得到，frame里的是错误的)
+    //av_q2d = return a.num / (double) a.den;
+    double pts = frame->pts * av_q2d(pFormatCtx->streams[videoStreamIndex]->time_base);
+    double duration = pts - time;
+    //重要操作。延迟播放,让每一帧在他该显示的地方显示
+    if(duration > 0)
+      SDL_Delay(duration * 1000);    
+
     //3.显示画面
     SDL_RenderPresent(render);
-    //重要操作。延迟播放
-    SDL_Delay(75);    
     //记得回收内存
     av_frame_free(&frame);
   }
