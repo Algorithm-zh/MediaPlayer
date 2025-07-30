@@ -14,10 +14,17 @@ extern "C" {
 #include <mutex>
 #include <condition_variable>
 #include <sys/time.h>
+#include <atomic>
 
+struct Frame
+{
+  AVFrame *frame;
+  double pts;//为什么要特意写pts,因为有可能原视频的pts丢失或者找不到，需要我们自己写
+  int data_bytes = 0;//每帧的字节数，方便音频同步时使用
+};
 class MediaPlayer {
   using PacketQueue = std::queue<AVPacket*>;
-  using FrameQueue = std::queue<AVFrame*>;
+  using FrameQueue = std::queue<Frame>;
 public:
   // 打开媒体文件并初始化
   MediaPlayer(const char *url);
@@ -36,7 +43,9 @@ public:
   void video_thread();
   void audio_thread();
   
-
+  //音视频同步
+  double synchronize_video(AVFrame *frame, double pts);
+  double get_audio_clock();
 
 private:
   // 开辟空间存储数据
@@ -97,6 +106,10 @@ private:
   SwrContext *swr_ctx{NULL};
   //音频格式转换时的缓冲区
   uint8_t *audio_buf = nullptr;
+  //当前播放音频帧的位置
+  std::atomic_int audio_buf_index{0};//配合buf使用
+  //当前播放音频帧的大小
+  std::atomic_int audio_buf_size{0};//配合buf使用
   
 
   //线程
@@ -116,6 +129,13 @@ private:
   //视频同步
   struct timeval start_time;
   struct timeval cur_time;
+  double video_clock{0.0};//上一帧的pts/预测下一帧的pts
+  std::atomic<double> audio_clock{0.0};//音频已经播放出去的时间
+  //记录上一帧的pts和延迟
+  double frame_last_pts{0.0};
+  double frame_last_delay{40e-3};
+  //frame_timer会一直累加在播放过程中计算的延时，和系统时间做比较
+  double frame_timer{0.0};
 };
  
 

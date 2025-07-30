@@ -1,15 +1,10 @@
 #include "player.h"
-#include <SDL2/SDL_events.h>
-#include <chrono>
-#include <libavformat/avformat.h>
-#include <libavutil/channel_layout.h>
-#include <libavutil/rational.h>
-#include <libavutil/samplefmt.h>
-#include <libswresample/swresample.h>
-#include <sys/select.h>
 namespace
 {
   const int MAX_QUEUE_SIZE = 1024;
+  const double AV_SYNC_THRESHOLD = 0.01;//音视频误差超过该阈值需要同步处理
+  const double AV_NOSYNC_THRESHOLD = 10.0;//差距超过该值就放弃同步直接播放
+  const double MAX_FRAME_DELAY = 100;
 }
 MediaPlayer::MediaPlayer(const char* url)
 {
@@ -208,8 +203,6 @@ void MediaPlayer::allocFrame()  {
 }
  
 void MediaPlayer::readData()  {
-  //获取开始读取包的时间
-  gettimeofday(&start_time, NULL);
   //开始从视频流中读取数据包
   while(!is_close && av_read_frame(pFormatCtx, packet) >= 0)
   {
@@ -248,18 +241,21 @@ MediaPlayer::~MediaPlayer()  {
  
 //使用sdl将yuv显示到屏幕上
 void MediaPlayer::showFrame()  {
-  
+  double delay, ref_clock, diff, sync_threshold, actual_delay;
   //初始化sdl, 这个函数需要和showFrame在一个线程里
   sdl_init();
-  std::unique_lock<std::mutex> lock(video_Frame_mtx);
+  //获取开始显示帧的时间
+  gettimeofday(&start_time, NULL);
   while(true)
   {
+    std::unique_lock<std::mutex> lock(video_Frame_mtx);
     video_Frame_cond.wait_for(lock, std::chrono::milliseconds(1000), [&](){
       return !vFrame_queue.empty();
     });
     if(is_close && vFrame_queue.empty())break;
     else if(vFrame_queue.empty())continue;
-    AVFrame *frame = vFrame_queue.front();
+    AVFrame *frame = vFrame_queue.front().frame;
+    double pts = vFrame_queue.front().pts;
     vFrame_queue.pop();
 
     //将像素格式转换为我们想要的
@@ -285,19 +281,65 @@ void MediaPlayer::showFrame()  {
       std::cerr << "复制纹理失败" << std::endl;
       return;
     }
-    
-    //获取当前时间
-    gettimeofday(&cur_time, NULL);
-    //得到从开始读取数据到现在时间过去了多久
-    double time = cur_time.tv_sec - start_time.tv_sec + (double)(cur_time.tv_usec - start_time.tv_usec) / 1000000.0;
-    //得到该帧还有多久才是他播放的时间(注意：时间基只能从AVFormatContext里得到，frame里的是错误的)
-    //av_q2d = return a.num / (double) a.den;
-    double pts = frame->pts * av_q2d(pFormatCtx->streams[videoStreamIndex]->time_base);
-    double duration = pts - time;
-    //重要操作。延迟播放,让每一帧在他该显示的地方显示
-    if(duration > 0)
-      SDL_Delay(duration * 1000);    
+    /*
+     音视频同步逻辑详解(音频为主)：
+      音频为主即让视频去凑近音频
+      获取当前帧的pts,与上一帧的pts相减得到delay（pts是每一帧显示完成的时间点）
+      那么正常情况下该帧就应该显示delay时间
+      但是由于解码速度、pts错误、以及pb帧等原因的影响，我们需要对其进行调整
+      获取音频时钟ref（也就是当前正在播放的音频位置的pts）
+      比较视频时钟和音频时钟的差距diff = pts - ref
+      然后设定一个阈值，阈值过大无法同步(本代码没有进行同步)
+      如果音频比视频快，减小delay时间,让视频帧快速显示完成
+      如果视频比音频快，将delay翻两倍,让视频帧多停留一会
+      设置frame_timer叠加每次的delay
+      然后将frame_timer和系统时钟time进行对比
+      那么该帧实际需要停留的时间就是actual_delay = frame_timer-time（让系统时钟到达我们设定的显示时间）
+      actual_delay如果过小设置一个最小显示时间(因为需要让一帧有停留时间，不然就相当于丢帧了)
+    */
+    //pts是指这一帧显示完的时间点
+    delay = pts - frame_last_pts; 
+    if(delay <= 0 || delay >= 1.0)
+    {
+      delay = frame_last_delay;
+    }
+    //为下个time保存
+    frame_last_delay = delay;
+    frame_last_pts = pts;
 
+    //获取音频时间⏰
+    ref_clock = get_audio_clock();
+    
+    //计算视频时间戳和音频时间之差
+    diff = pts - ref_clock;
+    //计算同步阈值
+    sync_threshold = (delay > AV_SYNC_THRESHOLD) ? delay : AV_SYNC_THRESHOLD;
+    if(std::fabs(diff) < AV_NOSYNC_THRESHOLD)
+    {
+      //音频比视频快，选择不延迟
+      if(diff <= -sync_threshold)
+      {
+        delay = 0;
+      }
+      //视频比音频快，延迟2倍
+      else if(diff >= sync_threshold)
+      {
+        delay = 2 * delay;
+      }
+    }
+    frame_timer += delay;
+    //计算一下真实时间
+    gettimeofday(&cur_time, NULL);
+    //计算从开始读包到现在过去了多长时间
+    double time = (cur_time.tv_sec - start_time.tv_sec) + (cur_time.tv_usec - start_time.tv_usec) / 1000000.0;
+    //计算实际延迟
+    actual_delay = frame_timer - time;
+    if(actual_delay < 0.010)
+    {
+      actual_delay = 0.010;
+    }
+    SDL_Delay(actual_delay * 1000 + 0.5);//+0.5是为了四舍五入
+    
     //3.显示画面
     SDL_RenderPresent(render);
     //记得回收内存
@@ -342,35 +384,58 @@ void MediaPlayer::audioCallback(void *userdata, Uint8 *stream, int len) {
 
 //音频回调函数
 void MediaPlayer::audioDataRead(void *userdata, Uint8 *stream, int len) {
-
-  //这个函数不需要写成循环，因为sdl会自己一直调用的
   AVCodecContext *aCodecCtx = (AVCodecContext *)userdata;
-  std::unique_lock<std::mutex> lock(audio_Frame_mtx);
-  if(aFrame_queue.empty())return;
-  AVFrame *frame = aFrame_queue.front();
-  aFrame_queue.pop();
-
-  //分配临时缓冲区
-  if(!audio_buf)
+  audio_buf_index = 0;
+  audio_buf_size = 0;
+  int len1 = 0;
+  //为何写个循环，因为要往len里填充数据，一帧音频帧可能不够,需要填充满
+  while(len > 0)
   {
-    std::cout << "未分配缓冲区" << std::endl;
-    audio_buf = (uint8_t*)av_malloc(192000);
+    if(audio_buf_index >= audio_buf_size)
+    {
+      std::unique_lock<std::mutex> lock(audio_Frame_mtx);
+      //注意点：这里选择先填充静音数据而不是直接返回，因为直接返回sdl会继续使用stream里的数据会形成杂音
+      if(aFrame_queue.empty())
+      {
+        memset(stream, 0, len);
+        return;
+      }
+      AVFrame *frame = aFrame_queue.front().frame;
+      //得到音频帧大小(注意这里没有很规范，因为下面转换格式了，正常应该下面转换格式后再获取数据大小，这里为了省事直接用之前的)
+      int audio_size = aFrame_queue.front().data_bytes;
+      //得到pts
+      audio_clock = aFrame_queue.front().pts * av_q2d(aStream->time_base);
+      aFrame_queue.pop();
+      //分配临时缓冲区
+      if(!audio_buf)
+      {
+        audio_buf = (uint8_t*)av_malloc(192000);
+      }
+      //音频格式转换
+      int out_samples = swr_convert(swr_ctx, (uint8_t * const *)&audio_buf, frame->nb_samples, frame->extended_data, frame->nb_samples);
+      if(audio_size < 0)
+      {
+        audio_buf_size = 1024;
+        memset(audio_buf, 0, audio_buf_size);
+      }
+      else
+      {
+        audio_buf_size = audio_size;
+      }
+      audio_buf_index = 0;
+      av_frame_free(&frame);
+    }
+    len1 = audio_buf_size - audio_buf_index;
+    if(len1 > len)
+    {
+      len1 = len;
+    }
+    //将音频数据拷贝到sdl要读取的缓冲区里
+    memcpy(stream, audio_buf + audio_buf_index, len1);
+    stream += len1;
+    audio_buf_index += len1;
+    len -= len1;
   }
-  //音频格式转换
-  int out_samples = swr_convert(swr_ctx, (uint8_t * const *)&audio_buf, frame->nb_samples, frame->extended_data, frame->nb_samples);
-  //获取音频帧的大小
-  int data_size = av_samples_get_buffer_size(frame->linesize, frame->ch_layout.nb_channels, frame->nb_samples, aCodecCtx->sample_fmt, 1);
-  //len为sdl需要我们写入的缓冲区的大小
-  if(data_size > len)
-  {
-    data_size = len;
-  }
-  //将音频数据拷贝到sdl要读取的缓冲区里
-  //memcpy(stream, frame->data[0], data_size);
-  memcpy(stream, audio_buf, data_size);
-  stream += data_size;
-  len -= data_size;
-  av_frame_free(&frame);
 }
 
  
@@ -421,6 +486,7 @@ int MediaPlayer::decode_packet(AVCodecContext* codecCtx, AVPacket* packet)  {
   }
   while(ret >= 0)
   {
+    double pts = 0;
     AVFrame *frame = av_frame_alloc();
     //解码后的数据从这个函数中读取,放入frame里(一帧一帧的读)
     ret = avcodec_receive_frame(codecCtx, frame);
@@ -443,11 +509,27 @@ int MediaPlayer::decode_packet(AVCodecContext* codecCtx, AVPacket* packet)  {
       if(vFrame_queue.size() > MAX_QUEUE_SIZE)
       {
         //缓冲队列过大，丢帧处理
-        AVFrame *old = vFrame_queue.front();
+        AVFrame *old = vFrame_queue.front().frame;
         vFrame_queue.pop();
         av_frame_free(&old);
       }
-      vFrame_queue.push(frame);
+      //获取pts,如果dts不存在但是opaque里有则用opaque里的值。不然就是dts,都没有就为0
+      if(packet->dts == AV_NOPTS_VALUE && frame->opaque && (int64_t)frame->opaque != AV_NOPTS_VALUE)
+      {
+        //将opaqueue强转为int64_t类型的指针然后取值
+        pts = *(int64_t*)frame->opaque; 
+      }
+      else if(packet->dts != AV_NOPTS_VALUE)
+      {
+        pts = packet->dts;
+      }
+      else
+      {
+        pts = 0;
+      }
+      pts *= av_q2d(vStream->time_base);
+      pts = synchronize_video(frame, pts);//处理一下pts
+      vFrame_queue.push({frame, pts});
       video_Frame_cond.notify_all();
     }
     else if(codecCtx->codec->type == AVMEDIA_TYPE_AUDIO)
@@ -455,11 +537,17 @@ int MediaPlayer::decode_packet(AVCodecContext* codecCtx, AVPacket* packet)  {
       std::lock_guard<std::mutex> lock(audio_Frame_mtx);
       if(aFrame_queue.size() > MAX_QUEUE_SIZE)
       {
-        AVFrame *old = aFrame_queue.front();
+        AVFrame *old = aFrame_queue.front().frame;
         aFrame_queue.pop();
         av_frame_free(&old);
       }
-      aFrame_queue.push(frame);
+      if(packet->pts != AV_NOPTS_VALUE)
+      {
+        pts = packet->pts;
+      }
+      //获取音频帧大小
+      int data_size = av_samples_get_buffer_size(frame->linesize, frame->ch_layout.nb_channels, frame->nb_samples, aCodecCtx->sample_fmt, 1);
+      aFrame_queue.push({frame,pts, data_size});
       audio_Frame_cond.notify_all();
     }
   }
@@ -519,4 +607,43 @@ void MediaPlayer::start()  {
   th[2].join();
   th[3].join();
   std::cout << "执行完毕" << std::endl;
+}
+ 
+//如果帧存在pts,直接返回即可，如果缺失，则通过video_clock来得到
+double MediaPlayer::synchronize_video(AVFrame *frame, double pts)  {
+  double frame_delay = 0;
+  if(pts != 0)
+  {
+    video_clock = pts;
+  }
+  else 
+  {
+    pts = video_clock;
+  }
+  //更新video_clock
+  frame_delay = av_q2d(vStream->time_base);
+  //处理重复帧的情况
+  frame_delay += frame->repeat_pict * (frame_delay * 0.5);
+  video_clock += frame_delay;//更新video_clock，存储下一帧的显示时间
+  return pts;
+}
+ 
+//获得音频时间钟
+//audio_clock记录的是一整个音频帧播放完的时间，但是声卡驱动填充播放还需要时间，所以需要通过计算得到实际正在播放的音频时钟
+double MediaPlayer::get_audio_clock()  {
+
+  double pts;
+  int hw_buf_size, bytes_per_sec, n;//还没有填充到sdl音频播放驱动里的数据量，每秒播放的字节数
+  
+  pts = audio_clock;
+  hw_buf_size = audio_buf_size - audio_buf_index;
+  bytes_per_sec = 0;
+  n = aCodecCtx->ch_layout.nb_channels * AV_SAMPLE_FMT_S16;//声道数✖️每个声道使用的位深(这里固定为了AV_SAMPLE_FMT_S16)
+  bytes_per_sec = aCodecCtx->sample_rate * n;
+  double tmp = (double)hw_buf_size / bytes_per_sec;
+  if(pts >= tmp)
+  {
+    pts -= tmp;
+  }
+  return pts;//实际播放的时间
 }
