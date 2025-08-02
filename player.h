@@ -15,19 +15,36 @@ extern "C" {
 #include <condition_variable>
 #include <sys/time.h>
 #include <atomic>
-
+namespace
+{
+  const int MAX_QUEUE_SIZE = 1024;
+  const double AV_SYNC_THRESHOLD = 0.01;//音视频误差超过该阈值需要同步处理
+  const double AV_NOSYNC_THRESHOLD = 10.0;//差距超过该值就放弃同步直接播放
+  const double MAX_FRAME_DELAY = 100;
+  const int AUDIO_DIFF_AVG_NB = 10;
+  const int SAMPLE_CORRECTION_PERCENT_MAX = 10;
+  const int SDL_AUDIO_BUFFER_SIZE = 1024;
+}
 struct Frame
 {
   AVFrame *frame;
   double pts;//为什么要特意写pts,因为有可能原视频的pts丢失或者找不到，需要我们自己写
   int data_bytes = 0;//每帧的字节数，方便音频同步时使用
 };
+enum class AV_SYNC_TYPE
+{
+  AV_SYNC_AUDIO_MASTER,
+  AV_SYNC_VIDEO_MASTER,
+  AV_SYNC_EXTERNAL_MASTER,
+};
+#define DEFAULT_AV_SYNC_TYPE AV_SYNC_TYPE::AV_SYNC_VIDEO_MASTER
+
 class MediaPlayer {
   using PacketQueue = std::queue<AVPacket*>;
   using FrameQueue = std::queue<Frame>;
 public:
   // 打开媒体文件并初始化
-  MediaPlayer(const char *url);
+  MediaPlayer(const char *url, AV_SYNC_TYPE av_sync_type = DEFAULT_AV_SYNC_TYPE);
   ~MediaPlayer();
   void start();
   // 读取数据,从视频流读取数据包packet并解码到frame中,并且转换成对应的格式存储起来
@@ -46,6 +63,10 @@ public:
   //音视频同步
   double synchronize_video(AVFrame *frame, double pts);
   double get_audio_clock();
+  double get_video_clock();
+  double get_master_clock();
+  double get_external_clock();
+  int synchronize_audio(short *samples, int samples_size, double pts);
 
 private:
   // 开辟空间存储数据
@@ -126,7 +147,8 @@ private:
   std::condition_variable audio_Frame_cond;
 
 
-  //视频同步
+  AV_SYNC_TYPE av_sync_type;
+  //音频为主的视频同步
   struct timeval start_time;
   struct timeval cur_time;
   double video_clock{0.0};//上一帧的pts/预测下一帧的pts
@@ -136,6 +158,20 @@ private:
   double frame_last_delay{40e-3};
   //frame_timer会一直累加在播放过程中计算的延时，和系统时间做比较
   double frame_timer{0.0};
+
+  //视频为主的视频同步
+  double video_current_pts{0.0};
+  struct timeval video_current_pts_time;
+  double audio_diff_cum{0.0};//加权平均值
+  int audio_diff_avg_count{0};
+  double audio_diff_avg_coef{0.0};//权重系数.越高表示过去的数据权重越高
+  double audio_diff_threshold{0.1};
+
+  //seek操作
+  int seek_req;
+  int seek_flags;
+  int64_t seek_pos;
+  double incr, pos;
 };
  
 

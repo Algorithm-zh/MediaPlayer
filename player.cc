@@ -1,12 +1,14 @@
 #include "player.h"
-namespace
-{
-  const int MAX_QUEUE_SIZE = 1024;
-  const double AV_SYNC_THRESHOLD = 0.01;//音视频误差超过该阈值需要同步处理
-  const double AV_NOSYNC_THRESHOLD = 10.0;//差距超过该值就放弃同步直接播放
-  const double MAX_FRAME_DELAY = 100;
-}
-MediaPlayer::MediaPlayer(const char* url)
+#include <SDL2/SDL_events.h>
+#include <SDL2/SDL_keycode.h>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <libavutil/mem.h>
+#include <libavutil/rational.h>
+#include <sys/select.h>
+
+MediaPlayer::MediaPlayer(const char* url, AV_SYNC_TYPE av_sync_type)
 {
   th.resize(4);
   /*
@@ -140,6 +142,12 @@ MediaPlayer::MediaPlayer(const char* url)
   audio_callback = audioCallback;
   wanted_spec.callback = audio_callback;//sdl会持续调用这个回调函数来填充固定数量的字节到音频缓冲区
   wanted_spec.userdata = this;//将this传入方便回调audioDateRead
+  
+  //初始化音频同步设置
+  //这个写法的意思是构造一个指数平均系数，影响范围约为NB帧，累计的误差约为0.01s
+  audio_diff_avg_coef = exp(log(0.01 / AUDIO_DIFF_AVG_NB));//exp和log抵消了，主要是显示表达意图
+  audio_diff_threshold = 2.0 * SDL_AUDIO_BUFFER_SIZE / aCodecCtx->sample_rate;
+
 
   //初始化滤镜上下文
   sws_ctx = sws_getContext(pCodecCtx->width, pCodecCtx->height,
@@ -215,6 +223,24 @@ void MediaPlayer::readData()  {
         std::cout << "SDL_QUIT" << std::endl;
         is_close = true;
         break;
+      case SDL_KEYDOWN:
+        switch(event.key.keysym.sym)
+        {
+          case SDLK_LEFT:
+            incr = -10.0;
+            goto do_seek;
+          case SDLK_RIGHT:
+            incr = 10.0;
+            goto do_seek;
+          case SDLK_UP:
+            incr = 60.0;
+            goto do_seek;
+          case SDLK_DOWN:
+            incr = -60.0;
+            goto do_seek;
+          do_seek:
+            break;
+        }
     }
   }
   is_close = true;
@@ -256,6 +282,8 @@ void MediaPlayer::showFrame()  {
     else if(vFrame_queue.empty())continue;
     AVFrame *frame = vFrame_queue.front().frame;
     double pts = vFrame_queue.front().pts;
+    video_current_pts = pts;
+    gettimeofday(&video_current_pts_time, NULL);
     vFrame_queue.pop();
 
     //将像素格式转换为我们想要的
@@ -307,24 +335,28 @@ void MediaPlayer::showFrame()  {
     frame_last_delay = delay;
     frame_last_pts = pts;
 
-    //获取音频时间⏰
-    ref_clock = get_audio_clock();
-    
-    //计算视频时间戳和音频时间之差
-    diff = pts - ref_clock;
-    //计算同步阈值
-    sync_threshold = (delay > AV_SYNC_THRESHOLD) ? delay : AV_SYNC_THRESHOLD;
-    if(std::fabs(diff) < AV_NOSYNC_THRESHOLD)
+    //确保当视频始终作为参考时钟时不进行视频同步操作
+    if(av_sync_type != AV_SYNC_TYPE::AV_SYNC_VIDEO_MASTER)
     {
-      //音频比视频快，选择不延迟
-      if(diff <= -sync_threshold)
+      //获取音频时间⏰
+      ref_clock = get_audio_clock();
+      
+      //计算视频时间戳和音频时间之差
+      diff = pts - ref_clock;
+      //计算同步阈值
+      sync_threshold = (delay > AV_SYNC_THRESHOLD) ? delay : AV_SYNC_THRESHOLD;
+      if(std::fabs(diff) < AV_NOSYNC_THRESHOLD)
       {
-        delay = 0;
-      }
-      //视频比音频快，延迟2倍
-      else if(diff >= sync_threshold)
-      {
-        delay = 2 * delay;
+        //音频比视频快，选择不延迟
+        if(diff <= -sync_threshold)
+        {
+          delay = 0;
+        }
+        //视频比音频快，延迟2倍
+        else if(diff >= sync_threshold)
+        {
+          delay = 2 * delay;
+        }
       }
     }
     frame_timer += delay;
@@ -404,7 +436,7 @@ void MediaPlayer::audioDataRead(void *userdata, Uint8 *stream, int len) {
       //得到音频帧大小(注意这里没有很规范，因为下面转换格式了，正常应该下面转换格式后再获取数据大小，这里为了省事直接用之前的)
       int audio_size = aFrame_queue.front().data_bytes;
       //得到pts
-      audio_clock = aFrame_queue.front().pts * av_q2d(aStream->time_base);
+      audio_clock = aFrame_queue.front().pts;
       aFrame_queue.pop();
       //分配临时缓冲区
       if(!audio_buf)
@@ -413,6 +445,8 @@ void MediaPlayer::audioDataRead(void *userdata, Uint8 *stream, int len) {
       }
       //音频格式转换
       int out_samples = swr_convert(swr_ctx, (uint8_t * const *)&audio_buf, frame->nb_samples, frame->extended_data, frame->nb_samples);
+      //同步音频时钟
+      audio_size = synchronize_audio((int16_t *)audio_buf, audio_size, audio_clock);
       if(audio_size < 0)
       {
         audio_buf_size = 1024;
@@ -543,7 +577,7 @@ int MediaPlayer::decode_packet(AVCodecContext* codecCtx, AVPacket* packet)  {
       }
       if(packet->pts != AV_NOPTS_VALUE)
       {
-        pts = packet->pts;
+        pts = packet->pts * av_q2d(aStream->time_base);
       }
       //获取音频帧大小
       int data_size = av_samples_get_buffer_size(frame->linesize, frame->ch_layout.nb_channels, frame->nb_samples, aCodecCtx->sample_fmt, 1);
@@ -646,4 +680,133 @@ double MediaPlayer::get_audio_clock()  {
     pts -= tmp;
   }
   return pts;//实际播放的时间
+}
+ 
+//获取视频时钟
+//这样实现而不是简单的使用pts可以防止误差过大
+double MediaPlayer::get_video_clock()  {
+  double delta;
+  gettimeofday(&cur_time, NULL);
+  delta = (cur_time.tv_sec - video_current_pts_time.tv_sec) + (cur_time.tv_usec - video_current_pts_time.tv_usec) / 1000000.0;
+	return video_current_pts + delta;
+}
+ 
+double MediaPlayer::get_master_clock()  {
+  if(av_sync_type == AV_SYNC_TYPE::AV_SYNC_VIDEO_MASTER)
+  {
+    return get_video_clock();
+  }
+  else if(av_sync_type == AV_SYNC_TYPE::AV_SYNC_AUDIO_MASTER)
+  {
+    return get_audio_clock();
+  }
+  else
+  {
+    return get_external_clock();
+  }
+}
+ 
+//同步音频时钟 
+//通过调整采样大小
+/*
+ * 通过写音频同步视频这个函数可以了解的难点：
+ * 我们如果单纯使用diff进行调整， 如果某次diff跳动过大，就会引起音频采样大幅度变化
+ * 而这样就会严重影响用户观看
+ * 采用的方式就是指数加权平均移动
+ * 让diff平滑调整，选择一个稳定的diff进行调整，这样就不会使大幅度的diff变化影响整体
+*/
+int MediaPlayer::synchronize_audio(short *samples, int samples_size, double pts)  {
+
+  int n;
+  double ref_clock;
+  n = 2 * aCodecCtx->ch_layout.nb_channels;
+
+  if(av_sync_type != AV_SYNC_TYPE::AV_SYNC_AUDIO_MASTER)
+  {
+    double diff, avg_diff;//误差和平滑后的误差
+    int wanted_size, min_size, max_size; //nb_samples
+
+    //这里是视频时钟为主.所以返回的是视频时钟
+    ref_clock = get_master_clock();
+    //当前音频时钟和视频时钟的差值
+    diff = get_audio_clock() - ref_clock;
+
+    //较小时才去矫正
+    if(diff < AV_NOSYNC_THRESHOLD)
+    {
+      //使用指数加权平均对差值进行平滑防止跳变引起错误的调整
+      //差值平滑累计
+      audio_diff_cum = diff + audio_diff_avg_coef * audio_diff_cum;//该式子取极限等价于diff*1/1-eof
+      //enum
+      if(audio_diff_avg_count < AUDIO_DIFF_AVG_NB)
+      {
+        audio_diff_avg_count ++;//用于确保前几次不生效直到稳定
+      }
+      else
+      {
+        //为何乘这个？因为要还原为diff,audio_diff_cum是“放大”后的值
+        avg_diff = audio_diff_cum * (1.0 - audio_diff_avg_coef);   
+        if(fabs(avg_diff) >= audio_diff_threshold)
+        {
+          //采样大小 = 采样率（1s采样多少次）* 差距时间 * 每个采样点的字节数 * 通道数
+          //也就是让采样大小更大或者更小，更大点就能让视频更长，否则更短
+          wanted_size = samples_size + (int)(diff * aCodecCtx->sample_rate) * n;
+          min_size = samples_size * (100 - SAMPLE_CORRECTION_PERCENT_MAX) / 100;
+          max_size = samples_size * (100 + SAMPLE_CORRECTION_PERCENT_MAX) / 100;
+          
+          if(wanted_size < min_size)
+          {
+            wanted_size = min_size;
+          }
+          else if(wanted_size > max_size)
+          {
+            wanted_size = wanted_size;
+          }
+          if(wanted_size < samples_size)
+          {
+            //如果是缩减直接删掉后面的
+            samples_size = wanted_size;
+          }
+          else if(wanted_size > samples_size)
+          {
+            uint8_t *sample_end, *q;
+            int nb;
+
+            //通过复制后面的采样点来加长音频
+            nb = wanted_size - samples_size;//需要增加的字节数
+            sample_end = (uint8_t*)samples + samples_size - n;
+
+            //分配新buffer(防止内存区域大小不够)
+            uint8_t *new_samples = (uint8_t*)av_malloc(wanted_size);
+            memcpy(new_samples, samples, samples_size);
+
+            //填充新样本
+            q = new_samples + samples_size;
+            while(nb > 0)
+            {
+              memcpy(q, sample_end, n);
+              q += n;
+              nb -= n;
+            }
+            //释放原来的buffer并指向新buffer
+            av_free(samples);
+            samples = (short*)new_samples;
+            samples_size = wanted_size;
+          }
+        }
+      }
+    }
+    else 
+    {
+      //差距过大，不再做渐进调节，而是直接重置状态，等待下一次稳定同步
+      audio_diff_avg_count = 0;
+      audio_diff_cum = 0;
+    }
+  }
+  return samples_size;
+}
+ 
+double MediaPlayer::get_external_clock()  {
+  gettimeofday(&cur_time, NULL);
+	return cur_time.tv_sec + cur_time.tv_usec / 1000000.0;
 }
