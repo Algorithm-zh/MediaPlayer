@@ -50,7 +50,7 @@ public:
   // 读取数据,从视频流读取数据包packet并解码到frame中,并且转换成对应的格式存储起来
   void readData();
   int decode_packet(AVCodecContext* codecCtx, AVPacket* packet);
-  int packet_queue_put();
+  int packet_queue_put(AVPacket *packet);
 
   //音频sdl回调函数
   void audioDataRead(void *userdata, Uint8 *stream, int len);
@@ -59,6 +59,7 @@ public:
   //解码线程
   void video_thread();
   void audio_thread();
+  void stream_thread(std::queue<AVPacket*>& queue, std::mutex& mtx, std::condition_variable& cond, AVCodecContext* codecCtx);
   
   //音视频同步
   double synchronize_video(AVFrame *frame, double pts);
@@ -67,6 +68,13 @@ public:
   double get_master_clock();
   double get_external_clock();
   int synchronize_audio(short *samples, int samples_size, double pts);
+
+  //seek操作
+  void stream_seek(int64_t pos, int rel);
+  void packet_queue_flush(PacketQueue& packet_queue, int stream_index, std::mutex& mtx);
+  void frame_queue_flush(std::queue<Frame>& queue, std::mutex& mtx);
+  void seek();
+  void control_thread();
 
 private:
   // 开辟空间存储数据
@@ -112,7 +120,7 @@ private:
   // 事件
   SDL_Event event;
   //结束符号
-  bool is_close{false};
+  std::atomic_bool is_close{false};
 
   PacketQueue vPacket_queue;
   PacketQueue aPacket_queue;
@@ -126,7 +134,7 @@ private:
   //音频格式转换部分
   SwrContext *swr_ctx{NULL};
   //音频格式转换时的缓冲区
-  uint8_t *audio_buf = nullptr;
+  uint8_t *audio_buf{NULL};
   //当前播放音频帧的位置
   std::atomic_int audio_buf_index{0};//配合buf使用
   //当前播放音频帧的大小
@@ -168,10 +176,12 @@ private:
   double audio_diff_threshold{0.1};
 
   //seek操作
-  int seek_req;
-  int seek_flags;
-  int64_t seek_pos;
-  double incr, pos;
+  std::atomic_bool seek_req{false};
+  int seek_flags{0};//前进or后退
+  int64_t seek_pos{0};
+  double incr{0.0};
+  double pos{0.0};
+  AVPacket* flush_pkt{NULL};//这个包用于让avcodec刷新自己缓冲区
 };
  
 
