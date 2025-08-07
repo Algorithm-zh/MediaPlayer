@@ -1,16 +1,9 @@
 #include "player.h"
-#include <SDL2/SDL_events.h>
-#include <SDL2/SDL_keycode.h>
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <libavutil/mem.h>
-#include <libavutil/rational.h>
-#include <sys/select.h>
 
 MediaPlayer::MediaPlayer(const char* url, AV_SYNC_TYPE av_sync_type)
+:av_sync_type(av_sync_type)
 {
-  th.resize(4);
+  th.resize(5);
   /*
   * AVFormatContext 包含了媒体信息有关的成员
   * struct AVInputFormat *iformat //封装格式的信息
@@ -183,6 +176,7 @@ void MediaPlayer::allocFrame()  {
   pFrame = av_frame_alloc(); 
   pFrameYUV = av_frame_alloc();
   packet = av_packet_alloc(); 
+  flush_pkt = av_packet_alloc();
   if(pFrame == NULL || pFrameYUV == NULL)
   {
     std::cerr << "分配视频帧空间失败" << stderr << std::endl;
@@ -212,36 +206,21 @@ void MediaPlayer::allocFrame()  {
  
 void MediaPlayer::readData()  {
   //开始从视频流中读取数据包
-  while(!is_close && av_read_frame(pFormatCtx, packet) >= 0)
+  while(!is_close)
   {
-    packet_queue_put();
+    //seek操作
+    if(seek_req.load())
+    {
+      std::cout << "seek_req:" << seek_req << std::endl;
+      seek();
+    }
+    if(av_read_frame(pFormatCtx, packet) < 0)
+    {
+      break;
+    }
+    packet_queue_put(packet);
     //释放掉packet指向的内存,以方便读下一个包
     av_packet_unref(packet);
-    SDL_PollEvent(&event);
-    switch (event.type) {
-      case SDL_QUIT:
-        std::cout << "SDL_QUIT" << std::endl;
-        is_close = true;
-        break;
-      case SDL_KEYDOWN:
-        switch(event.key.keysym.sym)
-        {
-          case SDLK_LEFT:
-            incr = -10.0;
-            goto do_seek;
-          case SDLK_RIGHT:
-            incr = 10.0;
-            goto do_seek;
-          case SDLK_UP:
-            incr = 60.0;
-            goto do_seek;
-          case SDLK_DOWN:
-            incr = -60.0;
-            goto do_seek;
-          do_seek:
-            break;
-        }
-    }
   }
   is_close = true;
   std::cout << "读取数据结束" << std::endl;
@@ -278,8 +257,10 @@ void MediaPlayer::showFrame()  {
     video_Frame_cond.wait_for(lock, std::chrono::milliseconds(1000), [&](){
       return !vFrame_queue.empty();
     });
+
     if(is_close && vFrame_queue.empty())break;
     else if(vFrame_queue.empty())continue;
+
     AVFrame *frame = vFrame_queue.front().frame;
     double pts = vFrame_queue.front().pts;
     video_current_pts = pts;
@@ -473,43 +454,44 @@ void MediaPlayer::audioDataRead(void *userdata, Uint8 *stream, int len) {
 }
 
  
-int MediaPlayer::packet_queue_put()  {
 
-  AVPacket *pkt = av_packet_alloc();
-  if(av_packet_ref(pkt, packet) < 0)
-  {
-    std::cerr << "packet copy失败" << std::endl;
+int MediaPlayer::packet_queue_put(AVPacket *packet) {
+  AVPacket* pkt = av_packet_alloc();
+  //设置不是flush_packet
+  if (packet != flush_pkt && av_packet_ref(pkt, packet) < 0) {
+    std::cerr << "packet 拷贝失败" << std::endl;
+    av_packet_free(&pkt);  // 避免内存泄漏
     return -1;
   }
-  if(pkt->stream_index == audioStreamIndex)
-  {
-    std::lock_guard<std::mutex> lock(audio_Packet_mtx);
-    //缓冲队列满了，选择丢包处理
-    if(aPacket_queue.size() >= MAX_QUEUE_SIZE)
-    {
-      AVPacket *old = aPacket_queue.front();
-      aPacket_queue.pop();
+
+  //这里为了将重复代码简化用了个lambda
+  auto enqueue_packet = [](std::queue<AVPacket*>& queue, std::mutex& mtx, std::condition_variable& cond, AVPacket* pkt) {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (queue.size() >= MAX_QUEUE_SIZE) {
+      AVPacket* old = queue.front();
+      queue.pop();
       av_packet_free(&old);
     }
-    aPacket_queue.push(pkt);
-    //缓冲队列新加了数据，唤醒条件变量
-    audio_Packet_cond.notify_all();
-  }
-  else if(pkt->stream_index == videoStreamIndex)
+    queue.push(pkt);
+    cond.notify_all();
+  };
+
+  if (pkt->stream_index == audioStreamIndex) 
   {
-    std::lock_guard<std::mutex> lock(video_Packet_mtx);
-    if(vPacket_queue.size() >= MAX_QUEUE_SIZE)
-    {
-      AVPacket *old = vPacket_queue.front();
-      vPacket_queue.pop();
-      av_packet_free(&old);
-    }
-    vPacket_queue.push(pkt); 
-    video_Packet_cond.notify_all();
+    enqueue_packet(aPacket_queue, audio_Packet_mtx, audio_Packet_cond, pkt);
+  } 
+  else if (pkt->stream_index == videoStreamIndex) 
+  {
+    enqueue_packet(vPacket_queue, video_Packet_mtx, video_Packet_cond, pkt);
+  } 
+  else 
+  {
+    av_packet_free(&pkt);  // 不属于音视频流，直接释放
   }
   return 0;
 }
- 
+
+
 int MediaPlayer::decode_packet(AVCodecContext* codecCtx, AVPacket* packet)  {
   //将数据包放入解码器解码
   int ret = avcodec_send_packet(codecCtx, packet);
@@ -589,57 +571,54 @@ int MediaPlayer::decode_packet(AVCodecContext* codecCtx, AVPacket* packet)  {
 }
  
 void MediaPlayer::video_thread()  {
-
-  std::unique_lock<std::mutex> lock(video_Packet_mtx);
-  while(true)
-  {
-    //条件变量阻塞直到有新数据进来
-    video_Packet_cond.wait_for(lock, std::chrono::milliseconds(1000), [&](){
-      return !vPacket_queue.empty();
-    });
-    //等待1000ms还没有数据认为程序已经结束
-    if(is_close && vPacket_queue.empty())break;
-    else if(vPacket_queue.empty())continue;//如果状态没有设置为已经关闭则继续
-    AVPacket *pkt = vPacket_queue.front();
-    vPacket_queue.pop();
-    //解码并放到帧队列
-    decode_packet(pCodecCtx, pkt);
-    av_packet_free(&pkt);
-  }
-  std::cout << "视频解码结束" << std::endl;
+ stream_thread(vPacket_queue, video_Packet_mtx, video_Packet_cond, pCodecCtx);
+ std::cout << "视频解码结束" << std::endl;
 }
 
- 
 void MediaPlayer::audio_thread()  {
-
-  std::unique_lock<std::mutex> lock(audio_Packet_mtx);
-  while(true)
+ stream_thread(aPacket_queue, audio_Packet_mtx, audio_Packet_cond, aCodecCtx);
+ std::cout << "音频解码结束" << std::endl;
+}
+ 
+void MediaPlayer::stream_thread(std::queue<AVPacket*>& queue, std::mutex& mtx, std::condition_variable& cond, AVCodecContext* codecCtx)
+{
+  std::unique_lock<std::mutex> lock(mtx);
+  while (true) 
   {
     //条件变量阻塞直到有新数据进来(最多等待1000ms)
-    audio_Packet_cond.wait_for(lock, std::chrono::milliseconds(1000), [&](){
-        return !aPacket_queue.empty();
+    cond.wait_for(lock, std::chrono::milliseconds(1000), [&]() {
+        return !queue.empty();
     });
     //等待1000ms还没有数据且设置关闭状态则认为程序已经结束
-    if(is_close && aPacket_queue.empty())break;
-    else if(aPacket_queue.empty())continue;
-    AVPacket *pkt = aPacket_queue.front();
-    aPacket_queue.pop();
-    decode_packet(aCodecCtx, pkt);
+    if (is_close && queue.empty()) break;
+    else if (queue.empty()) continue;//如果状态没有设置为已经关闭则继续
+
+    AVPacket* pkt = queue.front();
+    queue.pop();
+
+    //如果是刷新包则刷新avcodec缓冲区
+    if (pkt->data == flush_pkt->data) 
+    {
+      avcodec_flush_buffers(codecCtx);
+      continue;
+    }
+    decode_packet(codecCtx, pkt);
     av_packet_free(&pkt);
   }
-  std::cout << "音频解码结束" << std::endl;
 }
- 
+
 void MediaPlayer::start()  {
   th[0] = std::thread(&MediaPlayer::readData, this); 
   th[1] = std::thread(&MediaPlayer::video_thread, this); 
   th[2] = std::thread(&MediaPlayer::audio_thread, this); 
   th[3] = std::thread(&MediaPlayer::showFrame, this);
+  th[4] = std::thread(&MediaPlayer::control_thread, this);
 
   th[0].join();
   th[1].join();
   th[2].join();
   th[3].join();
+  th[4].join();
   std::cout << "执行完毕" << std::endl;
 }
  
@@ -748,6 +727,7 @@ int MediaPlayer::synchronize_audio(short *samples, int samples_size, double pts)
         avg_diff = audio_diff_cum * (1.0 - audio_diff_avg_coef);   
         if(fabs(avg_diff) >= audio_diff_threshold)
         {
+          
           //采样大小 = 采样率（1s采样多少次）* 差距时间 * 每个采样点的字节数 * 通道数
           //也就是让采样大小更大或者更小，更大点就能让视频更长，否则更短
           wanted_size = samples_size + (int)(diff * aCodecCtx->sample_rate) * n;
@@ -762,6 +742,7 @@ int MediaPlayer::synchronize_audio(short *samples, int samples_size, double pts)
           {
             wanted_size = wanted_size;
           }
+          
           if(wanted_size < samples_size)
           {
             //如果是缩减直接删掉后面的
@@ -789,7 +770,11 @@ int MediaPlayer::synchronize_audio(short *samples, int samples_size, double pts)
               nb -= n;
             }
             //释放原来的buffer并指向新buffer
-            av_free(samples);
+            // BUG FIX: COMMENTED OUT PROBLEMATIC CODE - samples was not allocated with av_malloc()
+            // av_free(samples);  // <- MISTAKE: Don't free samples that weren't allocated with av_malloc()
+            
+            // FIXED: Don't free the original samples buffer since it belongs to the audio frame
+            // The original samples buffer will be freed when the audio frame is freed
             samples = (short*)new_samples;
             samples_size = wanted_size;
           }
@@ -809,4 +794,116 @@ int MediaPlayer::synchronize_audio(short *samples, int samples_size, double pts)
 double MediaPlayer::get_external_clock()  {
   gettimeofday(&cur_time, NULL);
 	return cur_time.tv_sec + cur_time.tv_usec / 1000000.0;
+}
+ 
+void MediaPlayer::stream_seek(int64_t pos, int rel)  {
+  if(!seek_req.load()) 
+  {
+    seek_pos = pos;  
+    seek_flags = rel < 0 ? AVSEEK_FLAG_BACKWARD : 0;
+    seek_req.store(true);
+  }
+}
+ 
+void MediaPlayer::packet_queue_flush(PacketQueue& packet_queue, int stream_index, std::mutex &mtx)  {
+  std::lock_guard<std::mutex> lock(mtx);
+  while(!packet_queue.empty())
+  {
+    auto p = packet_queue.front();
+    packet_queue.pop();
+    av_packet_free(&p);
+  }
+  std::cout << "刷新完毕" << std::endl;
+}
+
+
+void MediaPlayer::frame_queue_flush(std::queue<Frame>& queue, std::mutex& mtx) {
+    std::lock_guard<std::mutex> lock(mtx);
+    while (!queue.empty()) {
+        AVFrame* frame = queue.front().frame;
+        queue.pop();
+        av_frame_free(&frame);
+    }
+}
+ 
+void MediaPlayer::seek()  {
+  int64_t seek_target = seek_pos;
+  int stream_index = -1;
+  std::cout << "seek" << std::endl;
+  if(videoStreamIndex >= 0)
+  {
+    stream_index = videoStreamIndex;
+  }
+  else if(audioStreamIndex >= 0)
+  {
+    stream_index = audioStreamIndex;
+  }
+  if(stream_index >= 0)
+  {
+    seek_target = av_rescale_q(seek_target, AV_TIME_BASE_Q, pFormatCtx->streams[stream_index]->time_base);
+    std::cout << "seek_target:" << seek_target << std::endl;
+    //跳转到seek_target位置，这个需要时间基正确，否则会出错
+    if(av_seek_frame(pFormatCtx, stream_index, seek_target, seek_flags) < 0)
+    {
+      std::cerr << "跳转失败" << std::endl;
+    }
+    else
+    {
+      //刷新packet队列
+      if(audioStreamIndex >= 0)
+      {
+        packet_queue_flush(aPacket_queue, audioStreamIndex, audio_Packet_mtx);
+        frame_queue_flush(aFrame_queue, audio_Frame_mtx);
+        //把刷新标志包放到队列里
+        packet_queue_put(flush_pkt);
+      }
+      if(videoStreamIndex >= 0)
+      {
+        packet_queue_flush(vPacket_queue, videoStreamIndex, video_Packet_mtx);
+        frame_queue_flush(vFrame_queue, video_Frame_mtx);
+        packet_queue_put(flush_pkt);
+      }
+    }
+    seek_req.store(false);
+  }
+}
+ 
+void MediaPlayer::control_thread()  {
+
+  while(true)
+  {
+    SDL_WaitEvent(&event);
+    switch (event.type) {
+      case SDL_QUIT:
+        std::cout << "SDL_QUIT" << std::endl;
+        is_close = true;
+        break;
+      case SDL_KEYDOWN:
+        switch(event.key.keysym.sym)
+        {
+          case SDLK_LEFT:
+            incr = -10.0;
+            goto do_seek;
+          case SDLK_RIGHT:
+            incr = 10.0;
+            goto do_seek;
+          case SDLK_UP:
+            incr = 60.0;
+            goto do_seek;
+          case SDLK_DOWN:
+            incr = -60.0;
+            goto do_seek;
+          do_seek:
+            
+            pos = get_master_clock();  
+            pos += incr;               
+            //Convert seconds to AV_TIME_BASE units before seeking
+            int64_t seek_pos_timebase = (int64_t)(pos * AV_TIME_BASE);
+            stream_seek(seek_pos_timebase, incr);
+            std::cout << "pos:" << pos << std::endl;
+            break;
+        }
+    }
+    if(is_close)break;
+  }
 }
