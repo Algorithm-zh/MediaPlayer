@@ -18,6 +18,8 @@ extern "C" {
 #include <condition_variable>
 #include <sys/time.h>
 #include <atomic>
+#include <map>
+#include "shader.h"
 
 namespace
 {
@@ -39,6 +41,8 @@ public:
   MediaPlayer(const char *url);
   ~MediaPlayer();
   void start();
+  void toggle_pause();
+  void seek(double offset);
   void readData();
   int decode_packet(AVCodecContext* codecCtx, AVPacket* packet);
   int packet_queue_put(AVPacket *packet);
@@ -62,6 +66,7 @@ private:
                            void *userData );
   int portAudioCallback(void *outputBuffer, unsigned long framesPerBuffer);
   static void framebuffer_size_callback(GLFWwindow* window, int width, int height);
+  void processInput(GLFWwindow *window);
 
 
   const char *url_;
@@ -85,11 +90,13 @@ private:
   struct SwrContext *swr_ctx{NULL};
 
   GLFWwindow *window{NULL};
-  GLuint shaderProgram;
+  Shader shader;
   GLuint vao, vbo;
   GLuint textures[3];
 
   std::atomic_bool is_close{false};
+  std::atomic_bool is_paused{false};
+  std::atomic_bool is_seeking{false};
 
   PacketQueue vPacket_queue;
   PacketQueue aPacket_queue;
@@ -116,4 +123,5 @@ private:
   unsigned int audio_buf_size{0};
   unsigned int audio_buf_index{0};
   std::atomic<double> audio_clock{0.0};
+  std::map<int, double> key_last_pressed;
 };

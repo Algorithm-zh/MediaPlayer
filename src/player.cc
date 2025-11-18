@@ -1,36 +1,5 @@
 #include "player.h"
 
-const char *vertexShaderSource = R"(
-#version 330 core
-layout (location = 0) in vec3 aPos;
-layout (location = 1) in vec2 aTexCoord;
-out vec2 TexCoord;
-void main()
-{
-    gl_Position = vec4(aPos, 1.0);
-    TexCoord = aTexCoord;
-}
-)";
-
-const char *fragmentShaderSource = R"(
-#version 330 core
-out vec4 FragColor;
-in vec2 TexCoord;
-uniform sampler2D texY;
-uniform sampler2D texU;
-uniform sampler2D texV;
-void main()
-{
-    float y = texture(texY, TexCoord).r;
-    float u = texture(texU, TexCoord).r - 0.5;
-    float v = texture(texV, TexCoord).r - 0.5;
-    float r = y + 1.402 * v;
-    float g = y - 0.344 * u - 0.714 * v;
-    float b = y + 1.772 * u;
-    FragColor = vec4(r, g, b, 1.0);
-}
-)";
-
 MediaPlayer::MediaPlayer(const char* url)
 {
     th.resize(4);
@@ -119,7 +88,6 @@ MediaPlayer::MediaPlayer(const char* url)
 }
 
 MediaPlayer::~MediaPlayer()  {
-    glDeleteProgram(shaderProgram);
     glDeleteVertexArrays(1, &vao);
     glDeleteBuffers(1, &vbo);
     glDeleteTextures(3, textures);
@@ -174,23 +142,7 @@ void MediaPlayer::gl_init() {
         return;
     }
 
-    // Shaders
-    GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
-    glCompileShader(vertexShader);
-
-    GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
-    glCompileShader(fragmentShader);
-
-    shaderProgram = glCreateProgram();
-    glAttachShader(shaderProgram, vertexShader);
-    glAttachShader(shaderProgram, fragmentShader);
-    glLinkProgram(shaderProgram);
-
-    glDeleteShader(vertexShader);
-    glDeleteShader(fragmentShader);
-
+    shader.init("shaders/vertex.vs", "shaders/fragment.fs");
     float vertices[] = {
         // positions         // texture coords
         1.0f,  1.0f, 0.0f,   1.0f, 0.0f,
@@ -223,11 +175,10 @@ void MediaPlayer::gl_init() {
 
     // Textures
     glGenTextures(3, textures);
-
-    glUseProgram(shaderProgram);
-    glUniform1i(glGetUniformLocation(shaderProgram, "texY"), 0);
-    glUniform1i(glGetUniformLocation(shaderProgram, "texU"), 1);
-    glUniform1i(glGetUniformLocation(shaderProgram, "texV"), 2);
+    shader.use();
+    shader.setInt("texY", 0);
+    shader.setInt("texU", 1);
+    shader.setInt("texV", 2);
     
     glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
 
@@ -250,6 +201,16 @@ void MediaPlayer::showFrame()  {
     
     while(!glfwWindowShouldClose(window))
     {
+        if(is_seeking) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        processInput(window);
+        if(is_paused) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            glfwPollEvents();
+            continue;
+        }
         std::unique_lock<std::mutex> lock(video_Frame_mtx);
         video_Frame_cond.wait_for(lock, std::chrono::milliseconds(1), [&](){
             return !vFrame_queue.empty();
@@ -309,7 +270,7 @@ void MediaPlayer::showFrame()  {
         glBindTexture(GL_TEXTURE_2D, textures[2]);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RED, pFrameYUV->width / 2, pFrameYUV->height / 2, 0, GL_RED, GL_UNSIGNED_BYTE, pFrameYUV->data[2]);
 
-        glUseProgram(shaderProgram);
+        shader.use();
         glBindVertexArray(vao);
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 
@@ -320,6 +281,35 @@ void MediaPlayer::showFrame()  {
     }
     is_close = true;
     std::cout << "视频播放结束" << std::endl;
+}
+
+void MediaPlayer::processInput(GLFWwindow *window)
+{
+    if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+        glfwSetWindowShouldClose(window, true);
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    double current_time = tv.tv_sec + tv.tv_usec / 1000000.0;
+
+    if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS) {
+        if (current_time - key_last_pressed[GLFW_KEY_SPACE] > 0.2) {
+            toggle_pause();
+            key_last_pressed[GLFW_KEY_SPACE] = current_time;
+        }
+    }
+    if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS) {
+        if (current_time - key_last_pressed[GLFW_KEY_RIGHT] > 0.2) {
+            seek(0.5);
+            key_last_pressed[GLFW_KEY_RIGHT] = current_time;
+        }
+    }
+    if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS) {
+        if (current_time - key_last_pressed[GLFW_KEY_LEFT] > 0.2) {
+            seek(-0.5);
+            key_last_pressed[GLFW_KEY_LEFT] = current_time;
+        }
+    }
 }
 
 void MediaPlayer::allocFrame()  {
@@ -341,9 +331,33 @@ void MediaPlayer::allocFrame()  {
 void MediaPlayer::readData()  {
   while(!is_close)
   {
-    if(av_read_frame(pFormatCtx, packet) < 0)
+    // Explicitly wait if seeking
+    while(is_seeking) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (is_close) return; // If player is closing while seeking, exit
+    }
+    // If paused, just sleep and continue
+    if(is_paused) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
+    }
+
+    int ret = av_read_frame(pFormatCtx, packet);
+    if(ret < 0)
     {
-      break;
+      if (ret == AVERROR_EOF) {
+          std::cerr << "readData: End of file reached." << std::endl;
+          if (is_close) { // If player is explicitly closing, then break
+              break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Wait a bit before trying again
+          continue; // Continue the loop to try reading again
+      } else {
+          char errbuf[AV_ERROR_MAX_STRING_SIZE];
+          av_make_error_string(errbuf, AV_ERROR_MAX_STRING_SIZE, ret);
+          std::cerr << "readData: Error reading frame: " << errbuf << std::endl;
+          break;
+      }
     }
     
     if (packet->stream_index == videoStreamIndex) {
@@ -471,10 +485,22 @@ void MediaPlayer::stream_thread(std::queue<AVPacket*>& queue, std::mutex& mtx, s
   while (true) 
   {
     cond.wait_for(lock, std::chrono::milliseconds(100), [&]() {
-        return !queue.empty();
+        return !queue.empty() || is_seeking || is_close;
     });
-    if (is_close && queue.empty()) break;
-    else if (queue.empty()) continue;
+
+    // Explicitly wait if seeking
+    while(is_seeking) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        if (is_close) return; // If player is closing while seeking, exit
+    }
+
+    if (is_close && queue.empty()) {
+        std::cout << "stream_thread: Exiting due to is_close and empty queue." << std::endl;
+        break;
+    }
+    else if (queue.empty()) {
+        continue;
+    }
 
     AVPacket* pkt = queue.front();
     queue.pop();
@@ -521,6 +547,10 @@ double MediaPlayer::get_audio_clock() {
     if (bytes_per_sec > 0) {
         pts -= (double)hw_buf_size / bytes_per_sec;
     }
+    if (pts < 0) { // Ensure clock doesn't go negative
+        pts = 0;
+    }
+    std::cout << "get_audio_clock: audio_clock=" << audio_clock << ", hw_buf_size=" << hw_buf_size << ", bytes_per_sec=" << bytes_per_sec << ", returning pts=" << pts << std::endl;
     return pts;
 }
 
@@ -534,6 +564,10 @@ int MediaPlayer::paCallback(const void *inputBuffer, void *outputBuffer,
 }
 
 int MediaPlayer::portAudioCallback(void *outputBuffer, unsigned long framesPerBuffer) {
+    if (is_paused || is_seeking) {
+        memset(outputBuffer, 0, framesPerBuffer * av_get_bytes_per_sample(AV_SAMPLE_FMT_S16) * aCodecCtx->ch_layout.nb_channels);
+        return paContinue;
+    }
     int len, audio_size;
     uint8_t *out = (uint8_t*)outputBuffer;
     unsigned long len_to_copy = framesPerBuffer * av_get_bytes_per_sample(AV_SAMPLE_FMT_S16) * aCodecCtx->ch_layout.nb_channels;
@@ -586,7 +620,94 @@ int MediaPlayer::audio_decode_frame(uint8_t *audio_buf, int buf_size) {
 
 void MediaPlayer::framebuffer_size_callback(GLFWwindow* window, int width, int height)
 {
-    // make sure the viewport matches the new window dimensions; note that width and 
-    // height will be significantly larger than specified on retina displays.
     glViewport(0, 0, width, height);
+}
+
+void MediaPlayer::toggle_pause()
+{
+    is_paused = !is_paused;
+}
+
+void MediaPlayer::seek(double offset)
+{
+    double current_pos = get_audio_clock();
+    double target_pos = current_pos + offset;
+    if (target_pos < 0) {
+        target_pos = 0;
+    }
+    if (target_pos > pFormatCtx->duration / AV_TIME_BASE) {
+        target_pos = pFormatCtx->duration / AV_TIME_BASE;
+    }
+
+    is_seeking = true;
+    is_close = false; // Ensure is_close is false when seeking
+
+    // Notify all threads to pause immediately
+    video_Packet_cond.notify_all();
+    audio_Packet_cond.notify_all();
+    video_Frame_cond.notify_all();
+    audio_Frame_cond.notify_all();
+
+    int64_t target_ts = target_pos * AV_TIME_BASE;
+
+    if (av_seek_frame(pFormatCtx, -1, target_ts, AVSEEK_FLAG_BACKWARD) < 0) {
+        std::cerr << "Error seeking frame to " << target_pos << "s" << std::endl;
+        is_seeking = false;
+        return;
+    } else {
+        std::cout << "Successfully sought to " << target_pos << "s" << std::endl;
+    }
+
+    // Flush the codec buffers
+    avcodec_flush_buffers(pCodecCtx);
+    avcodec_flush_buffers(aCodecCtx);
+
+    // Lock the queues and clear them
+    {
+        std::lock_guard<std::mutex> v_pkt_lock(video_Packet_mtx);
+        while(!vPacket_queue.empty()) {
+            av_packet_free(&vPacket_queue.front());
+            vPacket_queue.pop();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> a_pkt_lock(audio_Packet_mtx);
+        while(!aPacket_queue.empty()) {
+            av_packet_free(&aPacket_queue.front());
+            aPacket_queue.pop();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> v_frame_lock(video_Frame_mtx);
+        while(!vFrame_queue.empty()) {
+            av_frame_free(&vFrame_queue.front().frame);
+            vFrame_queue.pop();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> a_frame_lock(audio_Frame_mtx);
+        while(!aFrame_queue.empty()) {
+            av_frame_free(&aFrame_queue.front().frame);
+            aFrame_queue.pop();
+        }
+    }
+
+    // Reset audio buffer indices
+    audio_buf_index = 0;
+    audio_buf_size = 0;
+
+    audio_clock = target_pos;
+    video_clock = target_pos;
+    frame_last_pts = target_pos;
+    
+    struct timeval current_time;
+    gettimeofday(&current_time, NULL);
+    frame_timer = (double)current_time.tv_sec + (double)current_time.tv_usec / 1000000.0;
+
+    is_seeking = false;
+    // Notify all threads to resume
+    video_Packet_cond.notify_all();
+    audio_Packet_cond.notify_all();
+    video_Frame_cond.notify_all();
+    audio_Frame_cond.notify_all();
 }
