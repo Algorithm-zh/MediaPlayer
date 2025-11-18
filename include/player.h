@@ -124,4 +124,5 @@ private:
   unsigned int audio_buf_index{0};
   std::atomic<double> audio_clock{0.0};
   std::map<int, double> key_last_pressed;
+  std::atomic_bool needs_video_timer_reset_on_resume{false};
 };

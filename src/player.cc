@@ -201,11 +201,11 @@ void MediaPlayer::showFrame()  {
     
     while(!glfwWindowShouldClose(window))
     {
+        processInput(window);
         if(is_seeking) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        processInput(window);
         if(is_paused) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             glfwPollEvents();
@@ -224,6 +224,18 @@ void MediaPlayer::showFrame()  {
         vFrame_queue.pop();
         
         // -- AV Sync --
+        //解决暂停后继续播放时视频播放速度过快而音频正常播放的问题
+        //因为暂停之后再继续这个frame_timer的差距就和current_time差距太小了,sleep的时间就短了
+        //所以需要更新一下frame_timer
+        if (needs_video_timer_reset_on_resume) {
+            struct timeval cur_time;
+            gettimeofday(&cur_time, NULL);
+            double current_real_time = (double)cur_time.tv_sec + (double)cur_time.tv_usec / 1000000.0;
+            double ref_clock = get_audio_clock(); // Get current audio clock
+            frame_timer = current_real_time + (pts - ref_clock); // Reset frame_timer
+            needs_video_timer_reset_on_resume = false;
+        }
+
         double delay = pts - frame_last_pts;
         if(delay <= 0 || delay >= 1.0) {
             delay = frame_last_delay;
@@ -469,13 +481,13 @@ int MediaPlayer::decode_packet(AVCodecContext* codecCtx, AVPacket* packet)  {
 }
  
 void MediaPlayer::video_thread()  {
- stream_thread(vPacket_queue, video_Packet_mtx, video_Packet_cond, pCodecCtx);
- std::cout << "视频解码结束" << std::endl;
+  stream_thread(vPacket_queue, video_Packet_mtx, video_Packet_cond, pCodecCtx);
+  std::cout << "视频解码结束" << std::endl;
 }
 
 void MediaPlayer::audio_thread() {
-    stream_thread(aPacket_queue, audio_Packet_mtx, audio_Packet_cond, aCodecCtx);
-    std::cout << "音频解码结束" << std::endl;
+  stream_thread(aPacket_queue, audio_Packet_mtx, audio_Packet_cond, aCodecCtx);
+  std::cout << "音频解码结束" << std::endl;
 }
 
 
@@ -626,6 +638,9 @@ void MediaPlayer::framebuffer_size_callback(GLFWwindow* window, int width, int h
 void MediaPlayer::toggle_pause()
 {
     is_paused = !is_paused;
+    if (!is_paused) { // Resuming playback
+        needs_video_timer_reset_on_resume = true;
+    }
 }
 
 void MediaPlayer::seek(double offset)
@@ -635,8 +650,8 @@ void MediaPlayer::seek(double offset)
     if (target_pos < 0) {
         target_pos = 0;
     }
-    if (target_pos > pFormatCtx->duration / AV_TIME_BASE) {
-        target_pos = pFormatCtx->duration / AV_TIME_BASE;
+    if (target_pos > (float)pFormatCtx->duration / AV_TIME_BASE) {
+        target_pos = (float)pFormatCtx->duration / AV_TIME_BASE;
     }
 
     is_seeking = true;
