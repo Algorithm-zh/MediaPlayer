@@ -31,98 +31,57 @@ struct Frame
 {
   AVFrame *frame;
   double pts;
-  int data_bytes = 0;
 };
 
 class MediaPlayer {
   using PacketQueue = std::queue<AVPacket*>;
   using FrameQueue = std::queue<Frame>;
 public:
-  MediaPlayer(const char *url);
+  MediaPlayer(const std::vector<std::string>&urls);
   ~MediaPlayer();
   void start();
-  void toggle_pause();
-  void seek(double offset);
-  void readData();
-  int decode_packet(AVCodecContext* codecCtx, AVPacket* packet);
-  int packet_queue_put(AVPacket *packet);
-
-  void video_thread();
-  void audio_thread();
-  void stream_thread(std::queue<AVPacket*>& queue, std::mutex& mtx, std::condition_variable& cond, AVCodecContext* codecCtx);
-  
-  double synchronize_video(AVFrame *frame, double pts);
-  double get_audio_clock();
-
 private:
+  struct Channel{
+    AVFormatContext *fmt_ctx{NULL};
+    AVCodecContext *codec_ctx{NULL};
+    const AVCodec *codec{NULL};
+    AVStream *stream{NULL};
+    int stream_index{-1};
+    struct SwsContext *sws_ctx{NULL};
+    AVBSFContext *bsf_ctx{NULL};
+    PacketQueue packet_queue;
+    FrameQueue frame_queue;
+    int width{0};
+    int height{0};
+    GLuint textures[3]{0, 0, 0};
+    double clock{0.0};
+  };
+  void readData(int idx);
+  void decodeThread(int idx);
+  int packet_queue_put(AVPacket *packet);
+  double synchronize_video(int idx, AVFrame *frame, double pts);
+ 
   void allocFrame();
   void gl_init();
   void showFrame();
-  int audio_decode_frame(uint8_t *audio_buf, int buf_size);
-  static int paCallback( const void *inputBuffer, void *outputBuffer,
-                           unsigned long framesPerBuffer,
-                           const PaStreamCallbackTimeInfo* timeInfo,
-                           PaStreamCallbackFlags statusFlags,
-                           void *userData );
-  int portAudioCallback(void *outputBuffer, unsigned long framesPerBuffer);
-  static void framebuffer_size_callback(GLFWwindow* window, int width, int height);
   void processInput(GLFWwindow *window);
+  static void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 
+  const std::vector<std::string> urls;
+  std::vector<Channel> ch{3};
 
-  const char *url_;
-  AVFormatContext *pFormatCtx{NULL};
-  AVStream *vStream{NULL};
-  AVStream *aStream{NULL};
-  int videoStreamIndex{-1};
-  int audioStreamIndex{-1};
-
-  const AVCodec *pCodec{NULL};
-  const AVCodec *aCodec{NULL};
-
-  AVCodecContext *pCodecCtx{NULL};
-  AVCodecContext *aCodecCtx{NULL};
-
-  AVFrame *pFrame{NULL};
-  AVFrame *pFrameYUV{NULL};
-  AVPacket *packet;
-  struct SwsContext *sws_ctx{NULL};
-  AVBSFContext *bsf_ctx{NULL};
-  struct SwrContext *swr_ctx{NULL};
+  AVFrame *pFrame[3]{nullptr};
+  AVFrame *pFrameYUV[3]{nullptr};
+  AVPacket *packet[3]{nullptr};
 
   GLFWwindow *window{NULL};
   Shader shader;
   GLuint vao, vbo;
-  GLuint textures[3];
 
   std::atomic_bool is_close{false};
-  std::atomic_bool is_paused{false};
-  std::atomic_bool is_seeking{false};
-
-  PacketQueue vPacket_queue;
-  PacketQueue aPacket_queue;
-  FrameQueue vFrame_queue;
-  FrameQueue aFrame_queue;
 
   std::vector<std::thread> th;
-  std::mutex video_Packet_mtx;
-  std::mutex audio_Packet_mtx;
-  std::condition_variable video_Packet_cond;
-  std::condition_variable audio_Packet_cond;
-  std::mutex video_Frame_mtx;
-  std::mutex audio_Frame_mtx;
-  std::condition_variable video_Frame_cond;
-  std::condition_variable audio_Frame_cond;
+  std::mutex mtx_frame[3];
+  std::condition_variable cond_frame[3];
 
-  double video_clock{0.0};
-  double frame_last_pts{0.0};
-  double frame_last_delay{40e-3};
-  double frame_timer{0.0};
-  
-  PaStream *audio_stream{NULL};
-  uint8_t *audio_buf{NULL};
-  unsigned int audio_buf_size{0};
-  unsigned int audio_buf_index{0};
-  std::atomic<double> audio_clock{0.0};
-  std::map<int, double> key_last_pressed;
-  std::atomic_bool needs_video_timer_reset_on_resume{false};
 };
