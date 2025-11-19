@@ -34,7 +34,7 @@ MediaPlayer::MediaPlayer(const std::vector<std::string>& urls)
                                c.width, c.height, AV_PIX_FMT_YUV420P,
                                SWS_BILINEAR, nullptr, nullptr, nullptr);
 
-    
+
     // 分配 YUV 缓冲
     pFrameYUV[i] = av_frame_alloc();
     av_image_alloc(pFrameYUV[i]->data, pFrameYUV[i]->linesize,
@@ -67,6 +67,7 @@ MediaPlayer::~MediaPlayer()  {
 }
 
 void MediaPlayer::gl_init() {
+
   glfwInitHint(GLFW_WAYLAND_LIBDECOR, GLFW_FALSE);
   if (!glfwInit()) {
     std::cerr << "Failed to initialize GLFW" << std::endl;
@@ -75,12 +76,14 @@ void MediaPlayer::gl_init() {
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
   int max_w = 0, max_h = 0;
   for (auto& c : ch) {
     max_w = std::max(max_w, c.width);
     max_h = std::max(max_h, c.height);
   }
-  window = glfwCreateWindow(max_w * 3, max_h, "三路拼接播放视频", nullptr, nullptr);
+  // 窗口宽高按最大分辨率，保持16:9左右比例
+  window = glfwCreateWindow(max_w * 2, max_h, "三屏C形包围沉浸播放器", nullptr, nullptr);
   if (!window) {
     std::cerr << "Failed to create GLFW window" << std::endl;
     glfwTerminate();
@@ -95,17 +98,14 @@ void MediaPlayer::gl_init() {
   }
 
   shader.init("shaders/vertex.vs", "shaders/fragment.fs");
+
   float vertices[] = {
-    // positions         // texture coords
-    1.0f,  1.0f, 0.0f,   1.0f, 0.0f,
-    1.0f, -1.0f, 0.0f,   1.0f, 1.0f,
-    -1.0f, -1.0f, 0.0f,   0.0f, 1.0f,
-    -1.0f,  1.0f, 0.0f,   0.0f, 0.0f
+    1.0f,  1.0f, 0.0f,  1.0f, 0.0f,
+    1.0f, -1.0f, 0.0f,  1.0f, 1.0f,
+    -1.0f, -1.0f, 0.0f,  0.0f, 1.0f,
+    -1.0f,  1.0f, 0.0f,  0.0f, 0.0f
   };
-  unsigned int indices[] = {
-    0, 1, 3,
-    1, 2, 3
-  };
+  unsigned int indices[] = { 0, 1, 3, 1, 2, 3 };
 
   GLuint ebo;
   glGenVertexArrays(1, &vao);
@@ -113,10 +113,8 @@ void MediaPlayer::gl_init() {
   glGenBuffers(1, &ebo);
 
   glBindVertexArray(vao);
-
   glBindBuffer(GL_ARRAY_BUFFER, vbo);
   glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-
   glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
   glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
 
@@ -125,7 +123,6 @@ void MediaPlayer::gl_init() {
   glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
   glEnableVertexAttribArray(1);
 
-  //为每一路视频都创建yuv纹理
   for(int i = 0; i < 3; i ++){
     glGenTextures(3, ch[i].textures);
     for(int j = 0; j < 3; j ++){
@@ -135,26 +132,38 @@ void MediaPlayer::gl_init() {
                    (j == 0 ? ch[i].width : ch[i].width / 2),
                    (j == 0 ? ch[i].height : ch[i].height / 2),
                    0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
       glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     }
   }
-  // Textures
+
+  glEnable(GL_DEPTH_TEST);
+
   shader.use();
   shader.setInt("texY", 0);
   shader.setInt("texU", 1);
   shader.setInt("texV", 2);
-
 }
 
 void MediaPlayer::showFrame() {
   gl_init();
 
+  // 计算统一屏幕尺寸（按最大宽度，保持比例）
+  float max_w = 0, max_h = 0;
+  for (auto& c : ch) {
+    max_w = std::max(max_w, (float)c.width);
+    max_h = std::max(max_h, (float)c.height);
+  }
+  float aspect = max_h / max_w;
+  float screenWidth = 2.0f;                   // 3D空间中每块屏宽度
+  float screenHeight = screenWidth * aspect;
+
   while (!glfwWindowShouldClose(window)) {
     processInput(window);
 
+    // === 解码 + 上传纹理（你原来的代码完整复制）===
     bool has_frame = false;
     for (int i = 0; i < 3; ++i) {
       std::unique_lock<std::mutex> lk(mtx_frame[i]);
@@ -170,16 +179,15 @@ void MediaPlayer::showFrame() {
         sws_scale(ch[i].sws_ctx, frame->data, frame->linesize, 0, ch[i].height,
                   pFrameYUV[i]->data, pFrameYUV[i]->linesize);
 
-        // 上传 YUV 纹理（每路独立）
-        glActiveTexture(GL_TEXTURE0); 
+        glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, ch[i].textures[0]);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ch[i].width, ch[i].height, GL_RED, GL_UNSIGNED_BYTE, pFrameYUV[i]->data[0]);
 
-        glActiveTexture(GL_TEXTURE1); 
+        glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, ch[i].textures[1]);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ch[i].width/2, ch[i].height/2, GL_RED, GL_UNSIGNED_BYTE, pFrameYUV[i]->data[1]);
 
-        glActiveTexture(GL_TEXTURE2); 
+        glActiveTexture(GL_TEXTURE2);
         glBindTexture(GL_TEXTURE_2D, ch[i].textures[2]);
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ch[i].width/2, ch[i].height/2, GL_RED, GL_UNSIGNED_BYTE, pFrameYUV[i]->data[2]);
 
@@ -189,9 +197,7 @@ void MediaPlayer::showFrame() {
     }
     if (!has_frame) continue;
 
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    // 以第0路为主钟做简单同步
+    // === 简单音频同步（你原来的不变）===
     double master_pts = ch[0].clock;
     for (int i = 1; i < 3; ++i) {
       while (ch[i].clock < master_pts - 0.04 && !ch[i].frame_queue.empty()) {
@@ -200,49 +206,63 @@ void MediaPlayer::showFrame() {
       }
     }
 
-    // 三等分渲染
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    // === 统一的相机和投影 ===
+    glm::mat4 view = glm::lookAt(
+      glm::vec3(0.0f, 0.0f, 0.5f),    // 相机位置（稍微后退一点）
+      glm::vec3(0.0f, 0.0f, 0.0f),    // 看向原点
+      glm::vec3(0.0f, 1.0f, 0.0f)
+    );
+
     int win_w, win_h;
     glfwGetFramebufferSize(window, &win_w, &win_h);
-    int cell_w = win_w / 3;
-    float angles[3] = { 30.0f, 0.0f, -30.0f };
+    glm::mat4 projection = glm::perspective(glm::radians(75.0f), (float)win_w / win_h, 0.1f, 100.0f);
+
+    shader.use();
+    shader.setMat4("view", view);
+    shader.setMat4("projection", projection);
+
+    // === 循环绘制三块屏幕 ===
+    
     for (int i = 0; i < 3; ++i) {
-      glViewport(i * cell_w, 0, cell_w, win_h);
-      shader.use();
-      float radius = 3.5f;           // 这个值越大，三个画面越“平”，越小越有弧度
-      float angleStep = 27.0f;       // 27~30 度之间最自然（总视场约 45°×3 + 重叠）
-      // 相机在水平方向上摆成一个扇形，始终看向模型中心
-      float cameraAngle = (i - 1) * angleStep;   // -28°, 0°, +28°（角度自己调）
-      float camX = sin(glm::radians(cameraAngle)) * radius;  // 半径自己调
-      float camZ = cos(glm::radians(cameraAngle)) * radius;
+        glm::mat4 model = glm::mat4(1.0f);
 
-      glm::mat4 view = glm::lookAt(
-          glm::vec3(camX, 0.0f, camZ),     // 相机位置
-          glm::vec3(0.0f, 0.0f, 0.0f),     // 始终看向原点
-          glm::vec3(0.0f, 1.0f, 0.0f)
-      );
+        // === 关键修复：所有屏的平移距离都乘以 cos(foldAngle) ===
+        //float cosFactor = cos(glm::radians(foldAngle));  // 计算一次
+        float cosFactor = 0.85;  // 计算一次
+        float effectiveWidth = screenWidth * cosFactor;  // 投影后实际宽度
 
-      glm::mat4 model = glm::mat4(1.0f);   // 模型永远不旋转！！！
-      if(i == 1){
-        view = glm::translate(view, glm::vec3(0.0f,0.0f,-0.5f));
-      }
+        float xPos = (i - 1) * effectiveWidth;  // 用压缩后的宽度平移
+        model = glm::translate(model, glm::vec3(xPos, 0.0f, -screenDistance));
 
-      glm::mat4 projection = glm::perspective(glm::radians(45.0f), (float)cell_w / win_h, 0.1f, 100.0f);
+        // 左右屏旋转
+        if (i != 1) {
+            float angle = (i == 0 ? foldAngle : -foldAngle);
+            model = glm::rotate(model, glm::radians(angle), glm::vec3(0.0f, 1.0f, 0.0f));
+        }
 
+        // === 中间屏再额外缩小，让视觉大小完全一致 ===
+        if (i == 1) {
+            model = glm::scale(model, glm::vec3(cosFactor, cosFactor, 1.0f));
+        }
 
-      shader.setMat4("model", model);
-      shader.setMat4("view", view);
-      shader.setMat4("projection", projection);
-      glActiveTexture(GL_TEXTURE0);
-      glBindTexture(GL_TEXTURE_2D, ch[i].textures[0]);
-      glActiveTexture(GL_TEXTURE1);
-      glBindTexture(GL_TEXTURE_2D, ch[i].textures[1]);
-      glActiveTexture(GL_TEXTURE2);
-      glBindTexture(GL_TEXTURE_2D, ch[i].textures[2]);
+        shader.setMat4("model", model);
 
-      glBindVertexArray(vao);
-      glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+        // 黑边居中（保持不变）
+        float scaleX = (float)ch[i].width / max_w;
+        float offsetX = (1.0f - scaleX) * 0.5f;
+        shader.setVec2("uvOffset", glm::vec2(offsetX, 0.0f));
+        shader.setVec2("uvScale", glm::vec2(scaleX, 1.0f));
+
+        // 绑定纹理并绘制（保持不变）
+        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, ch[i].textures[0]);
+        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, ch[i].textures[1]);
+        glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, ch[i].textures[2]);
+
+        glBindVertexArray(vao);
+        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     }
-
 
     glfwSwapBuffers(window);
     glfwPollEvents();
@@ -250,6 +270,7 @@ void MediaPlayer::showFrame() {
 
   is_close = true;
 }
+
 void MediaPlayer::processInput(GLFWwindow *window)
 {
   if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
@@ -272,50 +293,50 @@ void MediaPlayer::allocFrame()  {
   }
 }
 void MediaPlayer::readData(int idx) {
-    Channel& c = ch[idx];
-    AVPacket pkt;  // 注意：不要提前 alloc，用栈上临时变量
+  Channel& c = ch[idx];
+  AVPacket pkt;  // 注意：不要提前 alloc，用栈上临时变量
 
-    while (!is_close) {
-        int ret = av_read_frame(c.fmt_ctx, &pkt);
-        if (ret < 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            continue;
-        }
-
-        if (pkt.stream_index == c.stream_index) {
-            if (c.bsf_ctx) {
-                // 先送原包
-                ret = av_bsf_send_packet(c.bsf_ctx, &pkt);
-                if (ret < 0) {
-                    av_packet_unref(&pkt);
-                    continue;
-                }
-
-                // 循环收所有过滤后的包
-                while (av_bsf_receive_packet(c.bsf_ctx, &pkt) == 0) {
-                    AVPacket* copy = av_packet_clone(&pkt);
-                    if (copy) {
-                        std::lock_guard<std::mutex> lk(mtx_frame[idx]);
-                        if (c.packet_queue.size() >= MAX_QUEUE_SIZE) {
-                            av_packet_free(&c.packet_queue.front());
-                            c.packet_queue.pop();
-                        }
-                        c.packet_queue.push(copy);
-                        cond_frame[idx].notify_one();
-                    }
-                }
-            } else {
-                // 无 bsf，直接 clone
-                AVPacket* copy = av_packet_clone(&pkt);
-                if (copy) {
-                    std::lock_guard<std::mutex> lk(mtx_frame[idx]);
-                    c.packet_queue.push(copy);
-                    cond_frame[idx].notify_one();
-                }
-            }
-        }
-        av_packet_unref(&pkt);  // 关键！每次都 unref 原始包
+  while (!is_close) {
+    int ret = av_read_frame(c.fmt_ctx, &pkt);
+    if (ret < 0) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      continue;
     }
+
+    if (pkt.stream_index == c.stream_index) {
+      if (c.bsf_ctx) {
+        // 先送原包
+        ret = av_bsf_send_packet(c.bsf_ctx, &pkt);
+        if (ret < 0) {
+          av_packet_unref(&pkt);
+          continue;
+        }
+
+        // 循环收所有过滤后的包
+        while (av_bsf_receive_packet(c.bsf_ctx, &pkt) == 0) {
+          AVPacket* copy = av_packet_clone(&pkt);
+          if (copy) {
+            std::lock_guard<std::mutex> lk(mtx_frame[idx]);
+            if (c.packet_queue.size() >= MAX_QUEUE_SIZE) {
+              av_packet_free(&c.packet_queue.front());
+              c.packet_queue.pop();
+            }
+            c.packet_queue.push(copy);
+            cond_frame[idx].notify_one();
+          }
+        }
+      } else {
+        // 无 bsf，直接 clone
+        AVPacket* copy = av_packet_clone(&pkt);
+        if (copy) {
+          std::lock_guard<std::mutex> lk(mtx_frame[idx]);
+          c.packet_queue.push(copy);
+          cond_frame[idx].notify_one();
+        }
+      }
+    }
+    av_packet_unref(&pkt);  // 关键！每次都 unref 原始包
+  }
 }
 
 void MediaPlayer::decodeThread(int idx) {
