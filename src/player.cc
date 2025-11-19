@@ -1,5 +1,7 @@
 #include "player.h"
-#include <libavformat/avformat.h>
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
 
 MediaPlayer::MediaPlayer(const std::vector<std::string>& urls)
 {
@@ -202,10 +204,34 @@ void MediaPlayer::showFrame() {
     int win_w, win_h;
     glfwGetFramebufferSize(window, &win_w, &win_h);
     int cell_w = win_w / 3;
-
+    float angles[3] = { 30.0f, 0.0f, -30.0f };
     for (int i = 0; i < 3; ++i) {
       glViewport(i * cell_w, 0, cell_w, win_h);
+      shader.use();
+      float radius = 3.5f;           // 这个值越大，三个画面越“平”，越小越有弧度
+      float angleStep = 27.0f;       // 27~30 度之间最自然（总视场约 45°×3 + 重叠）
+      // 相机在水平方向上摆成一个扇形，始终看向模型中心
+      float cameraAngle = (i - 1) * angleStep;   // -28°, 0°, +28°（角度自己调）
+      float camX = sin(glm::radians(cameraAngle)) * radius;  // 半径自己调
+      float camZ = cos(glm::radians(cameraAngle)) * radius;
 
+      glm::mat4 view = glm::lookAt(
+          glm::vec3(camX, 0.0f, camZ),     // 相机位置
+          glm::vec3(0.0f, 0.0f, 0.0f),     // 始终看向原点
+          glm::vec3(0.0f, 1.0f, 0.0f)
+      );
+
+      glm::mat4 model = glm::mat4(1.0f);   // 模型永远不旋转！！！
+      if(i == 1){
+        view = glm::translate(view, glm::vec3(0.0f,0.0f,-0.5f));
+      }
+
+      glm::mat4 projection = glm::perspective(glm::radians(45.0f), (float)cell_w / win_h, 0.1f, 100.0f);
+
+
+      shader.setMat4("model", model);
+      shader.setMat4("view", view);
+      shader.setMat4("projection", projection);
       glActiveTexture(GL_TEXTURE0);
       glBindTexture(GL_TEXTURE_2D, ch[i].textures[0]);
       glActiveTexture(GL_TEXTURE1);
@@ -213,10 +239,10 @@ void MediaPlayer::showFrame() {
       glActiveTexture(GL_TEXTURE2);
       glBindTexture(GL_TEXTURE_2D, ch[i].textures[2]);
 
-      shader.use();
       glBindVertexArray(vao);
       glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     }
+
 
     glfwSwapBuffers(window);
     glfwPollEvents();
