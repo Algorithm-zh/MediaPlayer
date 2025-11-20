@@ -55,6 +55,11 @@ private:
     int height{0};
     GLuint textures[3]{0, 0, 0};
     double clock{0.0};
+    double last_clock{0.0};
+    double last_delay{0.04};
+    double pts_base{0.04};
+    double time_base{0.04};
+    bool first_frame{true};
   };
   void readData(int idx);
   void decodeThread(int idx);

@@ -2,7 +2,13 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
+#include <libavcodec/codec.h>
+namespace{
 
+  static bool first_frame = true;
+  static double pts_base = 0.0;
+  static double time_base = 0.0;
+}
 MediaPlayer::MediaPlayer(const std::vector<std::string>& urls)
 {
   if (urls.size() != 3) {
@@ -22,7 +28,8 @@ MediaPlayer::MediaPlayer(const std::vector<std::string>& urls)
     if (c.stream_index < 0) continue;
 
     c.stream = c.fmt_ctx->streams[c.stream_index];
-    const AVCodec* decoder = avcodec_find_decoder(c.stream->codecpar->codec_id);
+    //const AVCodec* decoder = avcodec_find_decoder(c.stream->codecpar->codec_id);
+    const AVCodec* decoder = avcodec_find_decoder_by_name("h264_cuvid");
     c.codec_ctx = avcodec_alloc_context3(decoder);
     avcodec_parameters_to_context(c.codec_ctx, c.stream->codecpar);
     avcodec_open2(c.codec_ctx, decoder, nullptr);
@@ -140,7 +147,6 @@ void MediaPlayer::gl_init() {
   }
 
   glEnable(GL_DEPTH_TEST);
-
   shader.use();
   shader.setInt("texY", 0);
   shader.setInt("texU", 1);
@@ -157,8 +163,15 @@ void MediaPlayer::showFrame() {
     max_h = std::max(max_h, (float)c.height);
   }
   float aspect = max_h / max_w;
-  float screenWidth = 2.0f;                   // 3D空间中每块屏宽度
+  float screenWidth = 2.5f;                   // 3D空间中每块屏宽度
   float screenHeight = screenWidth * aspect;
+
+  // 获取当前时间（秒，双精度）
+  auto get_current_time = []() -> double {
+      struct timeval tv;
+      gettimeofday(&tv, nullptr);
+      return tv.tv_sec + tv.tv_usec / 1000000.0;
+  };
 
   while (!glfwWindowShouldClose(window)) {
     processInput(window);
@@ -175,6 +188,25 @@ void MediaPlayer::showFrame() {
         auto [frame, pts] = ch[i].frame_queue.front();
         ch[i].frame_queue.pop();
         ch[i].clock = pts;
+
+        if(ch[i].first_frame){
+          ch[i].pts_base = pts;
+          ch[i].time_base = get_current_time();
+          ch[i].first_frame = false;
+        }
+        double video_elapsed = pts - ch[i].pts_base;
+        double expected = ch[i].time_base + video_elapsed;
+        double now = get_current_time();
+        double sleep_sec = std::max(expected - now, sleep_sec) / 3;
+        std::cout << sleep_sec << std::endl;
+
+        // 每路独立平滑睡眠
+        static double smoothed[3] = {0};
+        smoothed[i] = smoothed[i] * 0.8 + sleep_sec * 0.2;
+
+        if (smoothed[i] > 0.002 && smoothed[i] < 0.1) {
+            std::this_thread::sleep_for(std::chrono::duration<double>(std::min(smoothed[i], 0.2)));
+        }
 
         sws_scale(ch[i].sws_ctx, frame->data, frame->linesize, 0, ch[i].height,
                   pFrameYUV[i]->data, pFrameYUV[i]->linesize);
@@ -195,66 +227,44 @@ void MediaPlayer::showFrame() {
         has_frame = true;
       }
     }
-    if (!has_frame) continue;
-
-    // === 简单音频同步（你原来的不变）===
-    double master_pts = ch[0].clock;
-    for (int i = 1; i < 3; ++i) {
-      while (ch[i].clock < master_pts - 0.04 && !ch[i].frame_queue.empty()) {
-        av_frame_free(&ch[i].frame_queue.front().frame);
-        ch[i].frame_queue.pop();
-      }
-    }
 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
     // === 统一的相机和投影 ===
     glm::mat4 view = glm::lookAt(
       glm::vec3(0.0f, 0.0f, 0.5f),    // 相机位置（稍微后退一点）
       glm::vec3(0.0f, 0.0f, 0.0f),    // 看向原点
       glm::vec3(0.0f, 1.0f, 0.0f)
     );
-
     int win_w, win_h;
     glfwGetFramebufferSize(window, &win_w, &win_h);
-    glm::mat4 projection = glm::perspective(glm::radians(75.0f), (float)win_w / win_h, 0.1f, 100.0f);
+    glm::mat4 projection = glm::perspective(glm::radians(65.0f), (float)win_w / win_h, 0.1f, 100.0f);
 
     shader.use();
     shader.setMat4("view", view);
     shader.setMat4("projection", projection);
 
     // === 循环绘制三块屏幕 ===
-    
     for (int i = 0; i < 3; ++i) {
+ 
         glm::mat4 model = glm::mat4(1.0f);
-
         // === 关键修复：所有屏的平移距离都乘以 cos(foldAngle) ===
         //float cosFactor = cos(glm::radians(foldAngle));  // 计算一次
-        float cosFactor = 0.85;  // 计算一次
+        float cosFactor = 0.86;  // 计算一次
         float effectiveWidth = screenWidth * cosFactor;  // 投影后实际宽度
-
         float xPos = (i - 1) * effectiveWidth;  // 用压缩后的宽度平移
         model = glm::translate(model, glm::vec3(xPos, 0.0f, -screenDistance));
-
         // 左右屏旋转
         if (i != 1) {
             float angle = (i == 0 ? foldAngle : -foldAngle);
             model = glm::rotate(model, glm::radians(angle), glm::vec3(0.0f, 1.0f, 0.0f));
         }
-
         // === 中间屏再额外缩小，让视觉大小完全一致 ===
         if (i == 1) {
-            model = glm::scale(model, glm::vec3(cosFactor, cosFactor, 1.0f));
+            model = glm::scale(model, glm::vec3(cosFactor + 0.3f, cosFactor, 1.0f));
         }
-
         shader.setMat4("model", model);
-
-        // 黑边居中（保持不变）
-        float scaleX = (float)ch[i].width / max_w;
-        float offsetX = (1.0f - scaleX) * 0.5f;
-        shader.setVec2("uvOffset", glm::vec2(offsetX, 0.0f));
-        shader.setVec2("uvScale", glm::vec2(scaleX, 1.0f));
-
+        shader.setVec2("uvOffset", glm::vec2(0.0f, 0.0f));
+        shader.setVec2("uvScale", glm::vec2(1.0f, 1.0f));
         // 绑定纹理并绘制（保持不变）
         glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, ch[i].textures[0]);
         glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, ch[i].textures[1]);
@@ -264,8 +274,8 @@ void MediaPlayer::showFrame() {
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     }
 
-    glfwSwapBuffers(window);
-    glfwPollEvents();
+      glfwSwapBuffers(window);
+      glfwPollEvents();
   }
 
   is_close = true;
