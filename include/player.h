@@ -88,6 +88,4 @@ private:
   std::vector<std::thread> th;
   std::mutex mtx_frame[3];
   std::condition_variable cond_frame[3];
-  float screenDistance = 2.8f;   // 屏幕离相机距离，越大越“平”，推荐2.5~3.5
-  float foldAngle = 35.0f;       // 左右屏内折角度，推荐30~40
 };

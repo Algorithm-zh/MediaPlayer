@@ -147,6 +147,8 @@ void MediaPlayer::gl_init() {
   }
 
   glEnable(GL_DEPTH_TEST);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   shader.use();
   shader.setInt("texY", 0);
   shader.setInt("texU", 1);
@@ -239,43 +241,54 @@ void MediaPlayer::showFrame() {
     glfwGetFramebufferSize(window, &win_w, &win_h);
     glm::mat4 projection = glm::perspective(glm::radians(65.0f), (float)win_w / win_h, 0.1f, 100.0f);
 
-    shader.use();
     shader.setMat4("view", view);
     shader.setMat4("projection", projection);
 
-    // === 循环绘制三块屏幕 ===
-    for (int i = 0; i < 3; ++i) {
- 
-        glm::mat4 model = glm::mat4(1.0f);
-        // === 关键修复：所有屏的平移距离都乘以 cos(foldAngle) ===
-        //float cosFactor = cos(glm::radians(foldAngle));  // 计算一次
-        float cosFactor = 0.86;  // 计算一次
-        float effectiveWidth = screenWidth * cosFactor;  // 投影后实际宽度
-        float xPos = (i - 1) * effectiveWidth;  // 用压缩后的宽度平移
-        model = glm::translate(model, glm::vec3(xPos, 0.0f, -screenDistance));
-        // 左右屏旋转
-        if (i != 1) {
-            float angle = (i == 0 ? foldAngle : -foldAngle);
-            model = glm::rotate(model, glm::radians(angle), glm::vec3(0.0f, 1.0f, 0.0f));
-        }
-        // === 中间屏再额外缩小，让视觉大小完全一致 ===
-        if (i == 1) {
-            model = glm::scale(model, glm::vec3(cosFactor + 0.3f, cosFactor, 1.0f));
-        }
-        shader.setMat4("model", model);
-        shader.setVec2("uvOffset", glm::vec2(0.0f, 0.0f));
-        shader.setVec2("uvScale", glm::vec2(1.0f, 1.0f));
-        // 绑定纹理并绘制（保持不变）
+    //关键的四个参数，通过调整这四个参数让视频达到完美融合
+    float foldAngle = 25.0f;
+    float screenDistance = 3.0f;
+    float blendWidth = 0.10f;
+    float overlap = 0.25f;
+    shader.setFloat("blendWidth", blendWidth);
+
+    glDepthMask(GL_FALSE);
+
+    int draw_order[] = {1, 0, 2}; // 1 = Center, 0 = Left, 2 = Right
+
+    for (int i : draw_order) {
+        // 绑定对应通道的纹理
         glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, ch[i].textures[0]);
         glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, ch[i].textures[1]);
         glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, ch[i].textures[2]);
 
+        shader.setInt("screenIndex", i);
+
+        glm::mat4 model = glm::mat4(1.0f);
+        float cosFactor = cos(glm::radians(foldAngle));
+        float effectiveWidth = screenWidth * cosFactor;
+        float xPos = (i - 1) * (effectiveWidth - overlap);
+        model = glm::translate(model, glm::vec3(xPos, 0.0f, -screenDistance));
+
+        if (i != 1) {
+            float angle = (i == 0 ? foldAngle : -foldAngle);
+            model = glm::rotate(model, glm::radians(angle), glm::vec3(0.0f, 1.0f, 0.0f));
+        }
+        if (i == 1) {
+            model = glm::scale(model, glm::vec3(cosFactor + 0.3f, cosFactor, 1.0f));
+        }
+
+        shader.setMat4("model", model);
+        shader.setVec2("uvOffset", glm::vec2(0.0f, 0.0f));
+        shader.setVec2("uvScale", glm::vec2(1.0f, 1.0f));
+
         glBindVertexArray(vao);
         glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     }
-
-      glfwSwapBuffers(window);
-      glfwPollEvents();
+    // --- 恢复渲染状态 ---
+    // 循环结束后，恢复到 gl_init 中设置的默认状态
+    glDepthMask(GL_TRUE);
+    glfwSwapBuffers(window);
+    glfwPollEvents();
   }
 
   is_close = true;
@@ -388,7 +401,7 @@ void MediaPlayer::decodeThread(int idx) {
     }
     av_packet_free(&pkt);
   }
-}
+  }
 
 
 
