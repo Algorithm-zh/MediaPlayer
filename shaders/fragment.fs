@@ -23,8 +23,7 @@ void main()
         alpha = 1.0 - smoothstep(1.0 - blendWidth, 1.0, TexCoord.x);
     } else if (screenIndex == 2) { // Right screen
         alpha = smoothstep(0.0, blendWidth, TexCoord.x);
-    }
+    }    
     // Center screen (screenIndex == 1) remains at alpha = 1.0
-
     FragColor = vec4(r, g, b, alpha);
 }

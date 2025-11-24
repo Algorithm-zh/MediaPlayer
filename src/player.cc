@@ -244,11 +244,14 @@ void MediaPlayer::showFrame() {
     shader.setMat4("view", view);
     shader.setMat4("projection", projection);
 
-    //关键的四个参数，通过调整这四个参数让视频达到完美融合
-    float foldAngle = 25.0f;
-    float screenDistance = 3.0f;
-    float blendWidth = 0.10f;
-    float overlap = 0.25f;
+    // --- 关键参数 ---
+    float foldAngle = 25.0f;      // 两侧屏幕弯折角度
+    float screenDistance = 3.0f;  // 屏幕与相机的距离
+    float overlap = 0.27f;        // 屏幕间物理重叠的宽度
+
+    // 根据物理重叠宽度，动态计算着色器所需的混合区域比例
+    float blendWidth = overlap / screenWidth; 
+
     shader.setFloat("blendWidth", blendWidth);
 
     glDepthMask(GL_FALSE);
@@ -274,7 +277,7 @@ void MediaPlayer::showFrame() {
             model = glm::rotate(model, glm::radians(angle), glm::vec3(0.0f, 1.0f, 0.0f));
         }
         if (i == 1) {
-            model = glm::scale(model, glm::vec3(cosFactor + 0.3f, cosFactor, 1.0f));
+            model = glm::scale(model, glm::vec3(cosFactor + 0.25f, cosFactor, 1.0f));
         }
 
         shader.setMat4("model", model);
