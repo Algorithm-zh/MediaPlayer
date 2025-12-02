@@ -2,8 +2,12 @@
 #include <iostream>
 
 bool OutStream::init(const std::string &url, int w, int h, int fps)  {
- if (url.empty()) return false;
- if(!fmt_ctx)return true;
+ if(fmt_ctx){
+   return true;
+ }
+ if (url.empty()){
+   return false;
+ } 
 
   width  = w;
   height = h;
@@ -96,6 +100,7 @@ bool OutStream::init(const std::string &url, int w, int h, int fps)  {
   rgb_flipped.resize(rgb_buffer.size());
   next_pts = 0;
 
+  push_enabled = true;
   std::cout << "推流初始化成功: " << url << std::endl;
   return true;
 }

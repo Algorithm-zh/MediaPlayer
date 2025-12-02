@@ -22,6 +22,7 @@ bool OpenglRender::Init(int width, int height, const char* title)  {
   glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
   glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
   glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+  glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
 
   // 窗口宽高按最大分辨率，保持16:9左右比例
   window = glfwCreateWindow(width, height, title, nullptr, nullptr);

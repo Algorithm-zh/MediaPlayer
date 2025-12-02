@@ -80,7 +80,7 @@ void MediaPlayer::showFrame() {
     renderer->GetFramebufferSize(win_w, win_h);
 
     //初始化推流
-    if(outStream.push_enabled && win_w && win_h){
+    if(!outStream.push_enabled && win_w && win_h){
       if(!outStream.init(push_url, win_w, win_h, 25)){
         std::cerr << "推流初始化失败，关闭推流" << std::endl;
         outStream.push_enabled = false;
@@ -90,7 +90,7 @@ void MediaPlayer::showFrame() {
     bool has_frame = false;
     for (int i = 0; i < 3; ++i) {
       std::unique_lock<std::mutex> lk(mtx_frame[i]);
-      cond_frame[i].wait_for(lk, std::chrono::milliseconds(1), [&]{
+      cond_frame[i].wait_for(lk, std::chrono::milliseconds(10), [&]{
         return !ch[i].frame_queue.empty();
       });
 
@@ -130,15 +130,14 @@ void MediaPlayer::showFrame() {
         has_frame = true;
       }
     }
-
     renderer->BeginFrame();
     //开始渲染
     renderer->RenderScene();
     //推流
-    if(outStream.push_enabled && has_frame)
+    int w = outStream.width;
+    int h = outStream.height;
+    if(outStream.push_enabled && has_frame && win_w >= w && win_h >= h)
     {
-      int w = outStream.width;
-      int h = outStream.height;
       int read_w = std::min(w, win_w);
       int read_h = std::min(h, win_h);
       
@@ -290,7 +289,7 @@ void MediaPlayer::start()  {
     max_w = std::max(max_w, c.width);
     max_h = std::max(max_h, c.height);
   }
-  if(!renderer->Init(max_w, max_h, "播放器")){
+  if(!renderer->Init(max_w * 2, max_h * 1.5, "播放器")){
     std::cerr << "渲染器初始化失败" << std::endl;
     delete renderer;
     is_close = true;
