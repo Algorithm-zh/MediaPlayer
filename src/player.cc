@@ -1,15 +1,13 @@
 #include "player.h"
+#include "OpenglRender.h"
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <libavcodec/codec.h>
-namespace{
+#include <libavutil/frame.h>
 
-  static bool first_frame = true;
-  static double pts_base = 0.0;
-  static double time_base = 0.0;
-}
-MediaPlayer::MediaPlayer(const std::vector<std::string>& urls)
+MediaPlayer::MediaPlayer(const std::vector<std::string>& urls, const std::string &push_url)
+  :push_url(push_url)
 {
   if (urls.size() != 3) {
     std::cerr << "必须提供 3 个视频路径" << std::endl;
@@ -41,14 +39,14 @@ MediaPlayer::MediaPlayer(const std::vector<std::string>& urls)
                                c.width, c.height, AV_PIX_FMT_YUV420P,
                                SWS_BILINEAR, nullptr, nullptr, nullptr);
 
-
-    // 分配 YUV 缓冲
     pFrameYUV[i] = av_frame_alloc();
-    av_image_alloc(pFrameYUV[i]->data, pFrameYUV[i]->linesize,
-                   c.width, c.height, AV_PIX_FMT_YUV420P, 1);
-    pFrameYUV[i]->width = c.width;
+    //重要操作：不然无法使用
+    av_image_alloc(pFrameYUV[i]->data, pFrameYUV[i]->linesize, 
+                   ch[i].width, ch[i].height, AV_PIX_FMT_YUV420P, 1);
+    pFrameYUV[i]->width  = c.width;
     pFrameYUV[i]->height = c.height;
   }
+
 }
 
 
@@ -56,117 +54,17 @@ MediaPlayer::~MediaPlayer()  {
   is_close = true;
   for (auto& t : th) if (t.joinable()) t.join();
 
-  glDeleteVertexArrays(1, &vao);
-  glDeleteBuffers(1, &vbo);
-  for (auto& c : ch) glDeleteTextures(3, c.textures);
-
-  if (window) glfwDestroyWindow(window);
-  glfwTerminate();
-
   for(int i = 0; i < 3; i ++){
-    if(pFrameYUV[i])av_frame_free(&pFrameYUV[i]);
-    av_frame_free(&pFrameYUV[i]); 
-    av_frame_free(&pFrame[i]);
-    av_packet_free(&packet[i]);
+    av_frame_free(&pFrameYUV[i]);
     avcodec_free_context(&ch[i].codec_ctx);
     avformat_close_input(&ch[i].fmt_ctx);
   }
 }
 
-void MediaPlayer::gl_init() {
 
-  glfwInitHint(GLFW_WAYLAND_LIBDECOR, GLFW_FALSE);
-  if (!glfwInit()) {
-    std::cerr << "Failed to initialize GLFW" << std::endl;
-    return;
-  }
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
-  glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-  glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
-  int max_w = 0, max_h = 0;
-  for (auto& c : ch) {
-    max_w = std::max(max_w, c.width);
-    max_h = std::max(max_h, c.height);
-  }
-  // 窗口宽高按最大分辨率，保持16:9左右比例
-  window = glfwCreateWindow(max_w * 2, max_h, "三屏C形包围沉浸播放器", nullptr, nullptr);
-  if (!window) {
-    std::cerr << "Failed to create GLFW window" << std::endl;
-    glfwTerminate();
-    return;
-  }
-  glfwMakeContextCurrent(window);
-  glfwSetFramebufferSizeCallback(window, framebuffer_size_callback);
-
-  if(!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)){
-    std::cerr << "Failed to initialize GLAD" << std::endl;
-    return;
-  }
-
-  shader.init("shaders/vertex.vs", "shaders/fragment.fs");
-
-  float vertices[] = {
-    1.0f,  1.0f, 0.0f,  1.0f, 0.0f,
-    1.0f, -1.0f, 0.0f,  1.0f, 1.0f,
-    -1.0f, -1.0f, 0.0f,  0.0f, 1.0f,
-    -1.0f,  1.0f, 0.0f,  0.0f, 0.0f
-  };
-  unsigned int indices[] = { 0, 1, 3, 1, 2, 3 };
-
-  GLuint ebo;
-  glGenVertexArrays(1, &vao);
-  glGenBuffers(1, &vbo);
-  glGenBuffers(1, &ebo);
-
-  glBindVertexArray(vao);
-  glBindBuffer(GL_ARRAY_BUFFER, vbo);
-  glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
-  glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
-
-  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0);
-  glEnableVertexAttribArray(0);
-  glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float)));
-  glEnableVertexAttribArray(1);
-
-  for(int i = 0; i < 3; i ++){
-    glGenTextures(3, ch[i].textures);
-    for(int j = 0; j < 3; j ++){
-      glActiveTexture(GL_TEXTURE0 + j);
-      glBindTexture(GL_TEXTURE_2D, ch[i].textures[j]);
-      glTexImage2D(GL_TEXTURE_2D, 0, GL_RED,
-                   (j == 0 ? ch[i].width : ch[i].width / 2),
-                   (j == 0 ? ch[i].height : ch[i].height / 2),
-                   0, GL_RED, GL_UNSIGNED_BYTE, nullptr);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    }
-  }
-
-  glEnable(GL_DEPTH_TEST);
-  glEnable(GL_BLEND);
-  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-  shader.use();
-  shader.setInt("texY", 0);
-  shader.setInt("texU", 1);
-  shader.setInt("texV", 2);
-}
 
 void MediaPlayer::showFrame() {
-  gl_init();
-
-  // 计算统一屏幕尺寸（按最大宽度，保持比例）
-  float max_w = 0, max_h = 0;
-  for (auto& c : ch) {
-    max_w = std::max(max_w, (float)c.width);
-    max_h = std::max(max_h, (float)c.height);
-  }
-  float aspect = max_h / max_w;
-  float screenWidth = 2.5f;                   // 3D空间中每块屏宽度
-  float screenHeight = screenWidth * aspect;
+  if(!renderer)return;
 
   // 获取当前时间（秒，双精度）
   auto get_current_time = []() -> double {
@@ -175,10 +73,20 @@ void MediaPlayer::showFrame() {
       return tv.tv_sec + tv.tv_usec / 1000000.0;
   };
 
-  while (!glfwWindowShouldClose(window)) {
-    processInput(window);
+  while (!renderer->ShouldClose() && !is_close) {
+    renderer->PollEvents();
 
-    // === 解码 + 上传纹理（你原来的代码完整复制）===
+    int win_w = 0, win_h = 0;
+    renderer->GetFramebufferSize(win_w, win_h);
+
+    //初始化推流
+    if(outStream.push_enabled && win_w && win_h){
+      if(!outStream.init(push_url, win_w, win_h, 25)){
+        std::cerr << "推流初始化失败，关闭推流" << std::endl;
+        outStream.push_enabled = false;
+      }
+    }
+
     bool has_frame = false;
     for (int i = 0; i < 3; ++i) {
       std::unique_lock<std::mutex> lk(mtx_frame[i]);
@@ -200,7 +108,6 @@ void MediaPlayer::showFrame() {
         double expected = ch[i].time_base + video_elapsed;
         double now = get_current_time();
         double sleep_sec = std::max(expected - now, sleep_sec) / 3;
-        std::cout << sleep_sec << std::endl;
 
         // 每路独立平滑睡眠
         static double smoothed[3] = {0};
@@ -213,85 +120,63 @@ void MediaPlayer::showFrame() {
         sws_scale(ch[i].sws_ctx, frame->data, frame->linesize, 0, ch[i].height,
                   pFrameYUV[i]->data, pFrameYUV[i]->linesize);
 
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, ch[i].textures[0]);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ch[i].width, ch[i].height, GL_RED, GL_UNSIGNED_BYTE, pFrameYUV[i]->data[0]);
-
-        glActiveTexture(GL_TEXTURE1);
-        glBindTexture(GL_TEXTURE_2D, ch[i].textures[1]);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ch[i].width/2, ch[i].height/2, GL_RED, GL_UNSIGNED_BYTE, pFrameYUV[i]->data[1]);
-
-        glActiveTexture(GL_TEXTURE2);
-        glBindTexture(GL_TEXTURE_2D, ch[i].textures[2]);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, ch[i].width/2, ch[i].height/2, GL_RED, GL_UNSIGNED_BYTE, pFrameYUV[i]->data[2]);
+        //将yuv原始视频里上传到纹理
+        renderer->UpLoadTexture(i, ch[i].width, ch[i].height,
+                        pFrameYUV[i]->data[0], 
+                        pFrameYUV[i]->data[1], 
+                        pFrameYUV[i]->data[2]);
 
         av_frame_free(&frame);
         has_frame = true;
       }
     }
 
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-    // === 统一的相机和投影 ===
-    glm::mat4 view = glm::lookAt(
-      glm::vec3(0.0f, 0.0f, 0.5f),    // 相机位置（稍微后退一点）
-      glm::vec3(0.0f, 0.0f, 0.0f),    // 看向原点
-      glm::vec3(0.0f, 1.0f, 0.0f)
-    );
-    int win_w, win_h;
-    glfwGetFramebufferSize(window, &win_w, &win_h);
-    glm::mat4 projection = glm::perspective(glm::radians(65.0f), (float)win_w / win_h, 0.1f, 100.0f);
-
-    shader.setMat4("view", view);
-    shader.setMat4("projection", projection);
-
-    // --- 关键参数 ---
-    float foldAngle = 25.0f;      // 两侧屏幕弯折角度
-    float screenDistance = 3.0f;  // 屏幕与相机的距离
-    float overlap = 0.27f;        // 屏幕间物理重叠的宽度
-
-    // 根据物理重叠宽度，动态计算着色器所需的混合区域比例
-    float blendWidth = overlap / screenWidth; 
-
-    shader.setFloat("blendWidth", blendWidth);
-
-    glDepthMask(GL_FALSE);
-
-    int draw_order[] = {1, 0, 2}; // 1 = Center, 0 = Left, 2 = Right
-
-    for (int i : draw_order) {
-        // 绑定对应通道的纹理
-        glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D, ch[i].textures[0]);
-        glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D, ch[i].textures[1]);
-        glActiveTexture(GL_TEXTURE2); glBindTexture(GL_TEXTURE_2D, ch[i].textures[2]);
-
-        shader.setInt("screenIndex", i);
-
-        glm::mat4 model = glm::mat4(1.0f);
-        float cosFactor = cos(glm::radians(foldAngle));
-        float effectiveWidth = screenWidth * cosFactor;
-        float xPos = (i - 1) * (effectiveWidth - overlap);
-        model = glm::translate(model, glm::vec3(xPos, 0.0f, -screenDistance));
-
-        if (i != 1) {
-            float angle = (i == 0 ? foldAngle : -foldAngle);
-            model = glm::rotate(model, glm::radians(angle), glm::vec3(0.0f, 1.0f, 0.0f));
+    renderer->BeginFrame();
+    //开始渲染
+    renderer->RenderScene();
+    //推流
+    if(outStream.push_enabled && has_frame)
+    {
+      int w = outStream.width;
+      int h = outStream.height;
+      int read_w = std::min(w, win_w);
+      int read_h = std::min(h, win_h);
+      
+      if (read_w > 0 && read_h > 0) {
+        float scale_w = static_cast<float>(read_w) / static_cast<float>(w);
+        float scale_h = static_cast<float>(read_h) / static_cast<float>(h);
+        
+        if (scale_w >= 0.9f && scale_h >= 0.9f) {
+          if (av_frame_make_writable(outStream.frame) >= 0) {
+            // 读取像素
+            if (renderer->ReadPixels(read_w, read_h, outStream.rgb_buffer.data())) {
+              // 翻转 Y 轴
+              std::fill(outStream.rgb_flipped.begin(), outStream.rgb_flipped.end(), 0);
+              int full_stride = w * 3;
+              int read_stride = read_w * 3;
+              for (int y = 0; y < read_h; ++y) {
+                std::memcpy(&outStream.rgb_flipped[y * full_stride],
+                            &outStream.rgb_buffer[(read_h - 1 - y) * read_stride],
+                            read_stride);
+              }
+              
+              // 转换并编码
+              uint8_t* src_data[1] = { outStream.rgb_flipped.data() };
+              int src_linesize[1] = { full_stride };
+              sws_scale(outStream.sws_out, src_data, src_linesize, 0, h,
+                        outStream.frame->data, outStream.frame->linesize);
+              
+              outStream.frame->pts = outStream.next_pts++;
+              outStream.encode_and_write();
+            }
+          }
         }
-        if (i == 1) {
-            model = glm::scale(model, glm::vec3(cosFactor + 0.25f, cosFactor, 1.0f));
-        }
+      }
 
-        shader.setMat4("model", model);
-        shader.setVec2("uvOffset", glm::vec2(0.0f, 0.0f));
-        shader.setVec2("uvScale", glm::vec2(1.0f, 1.0f));
-
-        glBindVertexArray(vao);
-        glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
     }
-    // --- 恢复渲染状态 ---
-    // 循环结束后，恢复到 gl_init 中设置的默认状态
-    glDepthMask(GL_TRUE);
-    glfwSwapBuffers(window);
-    glfwPollEvents();
+    
+    renderer->EndFrame();
+
   }
 
   is_close = true;
@@ -303,21 +188,6 @@ void MediaPlayer::processInput(GLFWwindow *window)
     glfwSetWindowShouldClose(window, true);
 }
 
-void MediaPlayer::allocFrame()  {
-  for(int i = 0; i < 3; i ++){
-    pFrame[i] = av_frame_alloc(); 
-    pFrameYUV[i] = av_frame_alloc();
-    if(pFrame[i] == NULL || pFrameYUV[i] == NULL) {
-      std::cerr << "分配视频帧空间失败" << stderr << std::endl;
-      return ;
-    }  
-    packet[i] = av_packet_alloc(); 
-    av_image_alloc(pFrameYUV[i]->data, pFrameYUV[i]->linesize, 
-                   ch[i].width, ch[i].height, AV_PIX_FMT_YUV420P, 1);
-    pFrameYUV[i]->width  = ch[i].width;
-    pFrameYUV[i]->height = ch[i].height;
-  }
-}
 void MediaPlayer::readData(int idx) {
   Channel& c = ch[idx];
   AVPacket pkt;  // 注意：不要提前 alloc，用栈上临时变量
@@ -325,7 +195,7 @@ void MediaPlayer::readData(int idx) {
   while (!is_close) {
     int ret = av_read_frame(c.fmt_ctx, &pkt);
     if (ret < 0) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
       continue;
     }
 
@@ -372,7 +242,7 @@ void MediaPlayer::decodeThread(int idx) {
     AVPacket* pkt = nullptr;
     {
       std::unique_lock<std::mutex> lk(mtx_frame[idx]);
-      cond_frame[idx].wait_for(lk, std::chrono::milliseconds(10), [&]{
+      cond_frame[idx].wait_for(lk, std::chrono::milliseconds(30), [&]{
         return !c.packet_queue.empty() || is_close;
       });
       if (c.packet_queue.empty()) continue;
@@ -404,7 +274,7 @@ void MediaPlayer::decodeThread(int idx) {
     }
     av_packet_free(&pkt);
   }
-  }
+}
 
 
 
@@ -413,7 +283,27 @@ void MediaPlayer::start()  {
     th.emplace_back(&MediaPlayer::readData, this, i);
     th.emplace_back(&MediaPlayer::decodeThread, this, i);
   }
+
+  renderer = new og::OpenglRender();
+  int max_w = 0, max_h = 0;
+  for(auto &c : ch){
+    max_w = std::max(max_w, c.width);
+    max_h = std::max(max_h, c.height);
+  }
+  if(!renderer->Init(max_w, max_h, "播放器")){
+    std::cerr << "渲染器初始化失败" << std::endl;
+    delete renderer;
+    is_close = true;
+    for(auto& t : th) if (t.joinable()) t.join();
+    return;
+  }
+
   showFrame();
+
+  if(renderer){
+    delete renderer;
+  }
+
   for(auto& t : th)t.join();
   std::cout << "执行完毕" << std::endl;
 }
@@ -431,7 +321,3 @@ double MediaPlayer::synchronize_video(int idx, AVFrame *frame, double pts)  {
   return pts;
 }
 
-void MediaPlayer::framebuffer_size_callback(GLFWwindow* window, int width, int height)
-{
-  glViewport(0, 0, width, height);
-}

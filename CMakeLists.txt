@@ -31,5 +31,4 @@ target_link_libraries(player
                       x264
                       glfw
                       OpenGL
-                      portaudio
                       pthread)
